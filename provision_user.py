@@ -467,73 +467,29 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     safe_sam = sanitize_for_powershell(sam_account_name)
     logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
 
-    # Use Get-ADUser with MemberOf, plus a separate query for the
-    # primary group. Also try tokenGroups as a fallback which captures
-    # all direct and nested group memberships.
-    script = f"""
-    Import-Module ActiveDirectory
-    $user = Get-ADUser -Identity '{safe_sam}' -Properties MemberOf, PrimaryGroup
-    $allGroups = [System.Collections.ArrayList]@()
+    # Keep it simple — exactly what works in interactive PowerShell.
+    # Use a one-liner to avoid any f-string brace escaping issues.
+    script = (
+        "Import-Module ActiveDirectory; "
+        f"(Get-ADUser -Identity '{safe_sam}' -Properties MemberOf).MemberOf | "
+        "ConvertTo-Json -Compress"
+    )
+    success, stdout, stderr = run_powershell(script, timeout=30)
 
-    # Add MemberOf groups
-    if ($user.MemberOf) {{
-        foreach ($g in $user.MemberOf) {{
-            [void]$allGroups.Add($g)
-        }}
-    }}
+    logger.info("AD groups lookup: success=%s, stdout_len=%d", success, len(stdout))
 
-    # If MemberOf was empty, try tokenGroups attribute which always works
-    if ($allGroups.Count -eq 0) {{
-        $userDN = $user.DistinguishedName
-        $adEntry = [ADSI]"LDAP://$userDN"
-        $adEntry.RefreshCache("tokenGroups")
-        foreach ($sid in $adEntry.Properties["tokenGroups"]) {{
-            $secId = New-Object System.Security.Principal.SecurityIdentifier($sid, 0)
-            try {{
-                $group = Get-ADGroup -Identity $secId
-                [void]$allGroups.Add($group.DistinguishedName)
-            }} catch {{}}
-        }}
-    }}
-
-    # Add primary group if not already included
-    if ($user.PrimaryGroup -and ($allGroups -notcontains $user.PrimaryGroup)) {{
-        [void]$allGroups.Add($user.PrimaryGroup)
-    }}
-
-    if ($allGroups.Count -gt 0) {{
-        $allGroups | ConvertTo-Json -Compress
-    }} else {{
-        Write-Output '[]'
-    }}
-    """
-    success, stdout, stderr = run_powershell(script, timeout=45)
-
-    # Extract JSON from output (skip any CLIXML progress lines)
-    lines = stdout.strip().split("\n")
-    json_line = ""
-    for line in reversed(lines):
-        line = line.strip()
-        if line.startswith("[") or line.startswith('"'):
-            json_line = line
-            break
-    if not json_line:
-        json_line = stdout.strip()
-
-    logger.info("AD groups lookup result: success=%s, output=%s", success, json_line[:500])
-
-    if not success:
-        logger.warning("Failed to get user AD groups: %s", stderr[:300])
+    if not stdout or stdout.strip() == "":
+        logger.info("User has no AD group memberships (MemberOf empty)")
         return []
 
     try:
-        data = json.loads(json_line) if json_line else []
+        data = json.loads(stdout)
         if isinstance(data, str):
             data = [data]
         logger.info("User AD groups found: %d", len(data))
         return data
     except json.JSONDecodeError:
-        logger.warning("Could not parse user AD groups: %s", json_line[:300])
+        logger.warning("Could not parse user AD groups: %s", stdout[:300])
         return []
 
 
