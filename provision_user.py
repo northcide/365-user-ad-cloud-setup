@@ -1042,11 +1042,43 @@ def trigger_delta_sync(server: str = None) -> tuple:
 #  CERTIFICATE GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _pfx_to_pem(pfx_bytes: bytes, password: str) -> str:
+    """
+    Convert PFX/PKCS#12 bytes to PEM string (private key + certificate).
+    Uses the 'cryptography' library (installed as a dependency of msal).
+    """
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PrivateFormat, NoEncryption, pkcs12,
+    )
+    from cryptography.hazmat.primitives.serialization.pkcs12 import (
+        load_key_and_certificates,
+    )
+
+    private_key, certificate, _ = load_key_and_certificates(
+        pfx_bytes, password.encode("utf-8")
+    )
+
+    # Export private key as PKCS8 PEM
+    key_pem = private_key.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.PKCS8,
+        encryption_algorithm=NoEncryption(),
+    ).decode("utf-8")
+
+    # Export certificate as PEM
+    cert_pem = certificate.public_bytes(Encoding.PEM).decode("utf-8")
+
+    return key_pem + cert_pem
+
+
 def generate_certificate_on_dc(cert_path: str = None) -> tuple:
     """
     Generate a self-signed certificate on the DC for Graph API authentication.
-    Exports private key as PEM and public key as CER.
-    After generation, auto-encrypts the PEM with DPAPI and deletes plaintext.
+
+    Strategy: PowerShell generates the cert and exports as PFX (works on all
+    .NET Framework versions). Python converts PFX to PEM using the cryptography
+    library (already installed as a dependency of msal). Then DPAPI-encrypts
+    the PEM and deletes all plaintext files.
 
     Args:
         cert_path: Override path for the PEM file. If None, uses cfg["graph_cert_path"].
@@ -1065,7 +1097,11 @@ def generate_certificate_on_dc(cert_path: str = None) -> tuple:
 
     cert_dir = os.path.dirname(pem_path)
     cer_path = pem_path.replace(".pem", ".cer")
+    pfx_path = pem_path.replace(".pem", ".pfx")
     protected_path = pem_path + ".protected"
+
+    # Use a random temp password for PFX export (only lives in memory briefly)
+    pfx_password = secrets.token_urlsafe(32)
 
     script = f"""
     # Create certificate directory
@@ -1086,25 +1122,15 @@ def generate_certificate_on_dc(cert_path: str = None) -> tuple:
     # Export public key as CER (for uploading to Azure)
     Export-Certificate -Cert $cert -FilePath '{cer_path}' -Force | Out-Null
 
-    # Export private key as PKCS8 PEM (required by MSAL Python)
-    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-    $privKeyBytes = $rsa.ExportPkcs8PrivateKey()
-    $privKeyB64 = [Convert]::ToBase64String($privKeyBytes, 'InsertLineBreaks')
-    $privKeyPem = "-----BEGIN PRIVATE KEY-----`n$privKeyB64`n-----END PRIVATE KEY-----"
-
-    # Also include the certificate (public key) in the PEM for MSAL
-    $certBytes = $cert.Export('Cert')
-    $certB64 = [Convert]::ToBase64String($certBytes, 'InsertLineBreaks')
-    $certPem = "-----BEGIN CERTIFICATE-----`n$certB64`n-----END CERTIFICATE-----"
-
-    $fullPem = $privKeyPem + "`n" + $certPem
-    [System.IO.File]::WriteAllText('{pem_path}', $fullPem, [System.Text.Encoding]::ASCII)
+    # Export as PFX with password (works on all .NET Framework versions)
+    $pfxPass = ConvertTo-SecureString -String '{pfx_password}' -AsPlainText -Force
+    Export-PfxCertificate -Cert $cert -FilePath '{pfx_path}' -Password $pfxPass -Force | Out-Null
 
     # Output thumbprint and paths for the caller
     $result = @{{
       thumbprint = $cert.Thumbprint
-      pem_path = '{pem_path}'
       cer_path = '{cer_path}'
+      pfx_path = '{pfx_path}'
       expiry = $cert.NotAfter.ToString('yyyy-MM-dd')
       subject = $cert.Subject
     }}
@@ -1121,9 +1147,29 @@ def generate_certificate_on_dc(cert_path: str = None) -> tuple:
     try:
         data = json.loads(stdout)
         thumbprint = data.get("thumbprint", "")
-        logger.info("Certificate generated — thumbprint: %s", thumbprint)
+        logger.info("Certificate generated -- thumbprint: %s", thumbprint)
     except json.JSONDecodeError:
         return False, "", f"Certificate may have been created but could not parse output: {stdout[:200]}"
+
+    # Convert PFX to PEM using Python's cryptography library
+    try:
+        with open(pfx_path, "rb") as f:
+            pfx_bytes = f.read()
+        pem_content = _pfx_to_pem(pfx_bytes, pfx_password)
+
+        # Write PEM to disk (will be DPAPI-encrypted and deleted below)
+        with open(pem_path, "w", encoding="ascii") as f:
+            f.write(pem_content)
+        logger.info("PFX converted to PEM successfully")
+    except Exception as e:
+        logger.error("PFX to PEM conversion failed: %s", e)
+        return False, thumbprint, f"Certificate generated (thumbprint: {thumbprint}) but PEM conversion failed: {e}"
+    finally:
+        # Always delete the PFX file -- it contains the private key
+        try:
+            os.remove(pfx_path)
+        except OSError:
+            pass
 
     # Auto-encrypt the PEM with DPAPI
     encrypt_success, encrypt_msg = dpapi_encrypt_file(pem_path, protected_path)
