@@ -301,8 +301,9 @@ def sanitize_for_powershell(value: str) -> str:
     Note: For passwords, we use -EncodedCommand instead of interpolation,
     so this is mainly for names, titles, etc.
     """
-    # Allow alphanumeric, spaces, hyphens, apostrophes, periods, commas
-    sanitized = re.sub(r"[^a-zA-Z0-9 \-'.,@()_]", "", value)
+    # Allow alphanumeric, spaces, hyphens, apostrophes, periods, commas,
+    # equals signs (needed for AD distinguished names like OU=Users,DC=domain)
+    sanitized = re.sub(r"[^a-zA-Z0-9 \-'.,@()_=]", "", value)
     # Double any single quotes for PowerShell string escaping
     sanitized = sanitized.replace("'", "''")
     return sanitized
