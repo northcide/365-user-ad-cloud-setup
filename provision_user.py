@@ -10,6 +10,21 @@ A production-ready GUI tool for MSP and enterprise admins that:
 
 Runs on a Windows Domain Controller under a domain admin context.
 Requires: Python 3.10+, msal, requests
+
+SECURITY MODEL
+──────────────
+- config.json contains non-secret values (tenant ID, client ID are not secrets
+  per Microsoft's own documentation — they are public identifiers).
+- The PEM private key is DPAPI-encrypted (Windows Data Protection API),
+  bound to the current Windows user account and the local machine's
+  master key. A stolen .protected file is useless on another machine
+  or under a different user account.
+- The app registration in Entra ID should use minimum required
+  permissions (User.ReadWrite.All, Directory.ReadWrite.All,
+  Organization.Read.All, Group.ReadWrite.All, GroupMember.ReadWrite.All).
+- The Graph access token only exists in memory, never written to disk.
+- Recommendation: restrict NTFS permissions on config.json and
+  .protected files to the service account running this tool.
 """
 
 import base64
@@ -20,6 +35,7 @@ import re
 import secrets
 import string
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -37,60 +53,81 @@ except ImportError as e:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION CONSTANTS — Edit these for your environment
+#  PATH RESOLUTION & CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# --- Domain ---
-AD_DOMAIN = "contoso.com"                           # FQDN of your AD domain
-AD_NETBIOS = "CONTOSO"                              # NetBIOS domain name
-DEFAULT_UPN_SUFFIX = "@contoso.com"
-EMAIL_DOMAINS = ["contoso.com", "fabrikam.com"]     # Dropdown choices for email
+def _get_app_dir():
+    """Get the directory where the EXE or script lives."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-# --- Azure AD Connect / Entra Connect ---
-# Set to a hostname to force a specific sync server, or None to auto-detect.
-ADSYNC_SERVER = None
 
-# --- Microsoft Graph / Entra ID ---
-GRAPH_TENANT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-GRAPH_CLIENT_ID = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # App Registration
-GRAPH_CERT_THUMBPRINT = "AABBCCDD..."
-GRAPH_CERT_PATH = r"C:\Certs\graph_app.pem"                # PEM with private key
+APP_DIR = _get_app_dir()
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+
+# Defaults for settings that don't need customer input
+DEFAULTS = {
+    "password_min_length": 12,
+    "password_require_upper": True,
+    "password_require_lower": True,
+    "password_require_digit": True,
+    "password_require_special": True,
+    "entra_poll_interval_seconds": 15,
+    "entra_poll_timeout_seconds": 300,
+    "log_dir": r"C:\Logs",
+    "log_file": r"C:\Logs\UserProvisioning.log",
+    "log_level": "INFO",
+    "disabled_service_plans": {},
+    "license_skus": {},
+}
+
+# Required keys that must be present in config.json
+REQUIRED_CONFIG_KEYS = [
+    "ad_domain", "ad_netbios", "email_domains",
+    "graph_tenant_id", "graph_client_id",
+    "graph_cert_thumbprint", "graph_cert_path",
+]
+
+# Graph scopes are constant — not customer-specific
 GRAPH_SCOPES = ["https://graph.microsoft.com/.default"]
 
-# --- License SKU mappings (friendly name -> skuId GUID) ---
-# These are examples — replace with your tenant's actual SKU IDs.
-# The tool also fetches available licenses dynamically from Graph.
-LICENSE_SKUS = {
-    "Microsoft 365 Business Premium": "cbdc14ab-d96c-4c30-b9f4-6ada7cdc1d46",
-    "Office 365 E3": "6fd2c87f-b296-42f0-b197-1e91e994b900",
-    "Office 365 E5": "c7df2760-2c81-4ef7-b578-5b5392b571df",
-    "Microsoft 365 E3": "05e9a617-0261-4cee-bb36-b42a0f4d2e45",
-}
-
-# --- Service plans to disable by default (per SKU ID) ---
-DISABLED_SERVICE_PLANS = {
-    # "cbdc14ab-...": ["57ff2da0-..."],  # Example: disable Sway in Business Premium
-}
-
-# --- Password Policy ---
-PASSWORD_MIN_LENGTH = 12
-PASSWORD_REQUIRE_UPPER = True
-PASSWORD_REQUIRE_LOWER = True
-PASSWORD_REQUIRE_DIGIT = True
-PASSWORD_REQUIRE_SPECIAL = True
-
-# --- Sync & Polling ---
-ENTRA_POLL_INTERVAL_SECONDS = 15
-ENTRA_POLL_TIMEOUT_SECONDS = 300    # 5 minutes
-
-# --- Logging ---
-LOG_DIR = r"C:\Logs"
-LOG_FILE = r"C:\Logs\UserProvisioning.log"
-LOG_LEVEL = "INFO"
-
-# --- UI ---
-WINDOW_TITLE = "365 User Provisioning Tool"
+# UI constants — not customer-specific
 WINDOW_SIZE = "800x950"
+
+
+def load_config() -> dict:
+    """
+    Load configuration from config.json, merging with defaults.
+
+    Returns the merged config dict. If config.json doesn't exist or is
+    invalid, returns defaults with empty strings for required keys.
+    """
+    merged = dict(DEFAULTS)
+
+    if not os.path.isfile(CONFIG_PATH):
+        # Return defaults with empty placeholders for required keys
+        for key in REQUIRED_CONFIG_KEYS:
+            merged.setdefault(key, "" if key != "email_domains" else [])
+        return merged
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            user_cfg = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logging.getLogger("UserProvisioning").error(
+            "Failed to load config.json: %s", e)
+        for key in REQUIRED_CONFIG_KEYS:
+            merged.setdefault(key, "" if key != "email_domains" else [])
+        return merged
+
+    # Merge: user values override defaults
+    merged.update(user_cfg)
+    return merged
+
+
+# Load config at module level — used by all functions
+cfg = load_config()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -99,18 +136,21 @@ WINDOW_SIZE = "800x950"
 
 def setup_logging():
     """Configure file and console logging. Creates log directory if needed."""
+    log_dir = cfg.get("log_dir", DEFAULTS["log_dir"])
+    log_file = cfg.get("log_file", DEFAULTS["log_file"])
+    log_level = cfg.get("log_level", DEFAULTS["log_level"])
+
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
     except OSError:
-        # Fall back to temp dir if C:\Logs isn't writable
-        global LOG_FILE
-        LOG_FILE = os.path.join(os.environ.get("TEMP", "."), "UserProvisioning.log")
+        # Fall back to temp dir if log dir isn't writable
+        log_file = os.path.join(os.environ.get("TEMP", "."), "UserProvisioning.log")
 
     logger = logging.getLogger("UserProvisioning")
-    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    logger.setLevel(getattr(logging, log_level, logging.INFO))
 
     # File handler — detailed
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(message)s",
@@ -128,6 +168,92 @@ def setup_logging():
 
 
 logger = setup_logging()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DPAPI ENCRYPTION (Windows Data Protection API)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def dpapi_encrypt_file(plain_path: str, protected_path: str) -> tuple:
+    """
+    Encrypt a file using Windows DPAPI (CurrentUser scope).
+
+    Reads the plaintext file, encrypts the bytes with DPAPI via PowerShell,
+    writes the result as base64 to the .protected file, then deletes the
+    plaintext file.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    if not os.path.isfile(plain_path):
+        return False, f"Source file not found: {plain_path}"
+
+    # Use PowerShell to encrypt via DPAPI
+    # We read the file in PowerShell to avoid shell interpolation issues with
+    # PEM content (which contains special characters)
+    script = f"""
+    Add-Type -AssemblyName System.Security
+    $plainBytes = [System.IO.File]::ReadAllBytes('{plain_path}')
+    $encBytes = [System.Security.Cryptography.ProtectedData]::Protect(
+        $plainBytes, $null,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    $b64 = [Convert]::ToBase64String($encBytes)
+    Set-Content -Path '{protected_path}' -Value $b64 -Encoding ASCII
+    Write-Output 'DPAPI_OK'
+    """
+    success, stdout, stderr = run_powershell(script, timeout=15)
+
+    if not success or "DPAPI_OK" not in stdout:
+        return False, f"DPAPI encryption failed: {stderr[:300]}"
+
+    # Delete the plaintext file
+    try:
+        os.remove(plain_path)
+        logger.info("DPAPI encrypted %s -> %s (plaintext deleted)", plain_path, protected_path)
+    except OSError as e:
+        logger.warning("Could not delete plaintext file %s: %s", plain_path, e)
+        return True, (
+            f"Encrypted to {protected_path}, but could not delete plaintext: {e}. "
+            "Please delete it manually for security."
+        )
+
+    return True, f"Encrypted to {protected_path}"
+
+
+def dpapi_decrypt_to_memory(protected_path: str) -> str:
+    """
+    Decrypt a DPAPI-protected file and return contents as a string.
+
+    Never writes plaintext to disk. The decrypted content is returned
+    directly from the PowerShell pipeline as a string.
+
+    Returns:
+        The decrypted file contents as a string.
+
+    Raises:
+        RuntimeError if decryption fails.
+    """
+    if not os.path.isfile(protected_path):
+        raise RuntimeError(f"Protected file not found: {protected_path}")
+
+    script = f"""
+    Add-Type -AssemblyName System.Security
+    $b64 = Get-Content -Path '{protected_path}' -Raw
+    $encBytes = [Convert]::FromBase64String($b64.Trim())
+    $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $encBytes, $null,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    $text = [System.Text.Encoding]::UTF8.GetString($plainBytes)
+    Write-Output $text
+    """
+    success, stdout, stderr = run_powershell(script, timeout=15)
+
+    if not success:
+        raise RuntimeError(f"DPAPI decryption failed: {stderr[:300]}")
+
+    return stdout
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -184,15 +310,16 @@ def validate_password_complexity(password: str) -> tuple:
     """
     errors = []
 
-    if len(password) < PASSWORD_MIN_LENGTH:
-        errors.append(f"Must be at least {PASSWORD_MIN_LENGTH} characters")
-    if PASSWORD_REQUIRE_UPPER and not re.search(r"[A-Z]", password):
+    min_len = cfg["password_min_length"]
+    if len(password) < min_len:
+        errors.append(f"Must be at least {min_len} characters")
+    if cfg["password_require_upper"] and not re.search(r"[A-Z]", password):
         errors.append("Must contain at least one uppercase letter")
-    if PASSWORD_REQUIRE_LOWER and not re.search(r"[a-z]", password):
+    if cfg["password_require_lower"] and not re.search(r"[a-z]", password):
         errors.append("Must contain at least one lowercase letter")
-    if PASSWORD_REQUIRE_DIGIT and not re.search(r"\d", password):
+    if cfg["password_require_digit"] and not re.search(r"\d", password):
         errors.append("Must contain at least one digit")
-    if PASSWORD_REQUIRE_SPECIAL and not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>/?]", password):
+    if cfg["password_require_special"] and not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>/?]", password):
         errors.append("Must contain at least one special character")
 
     return len(errors) == 0, errors
@@ -202,13 +329,13 @@ def generate_password(length: int = 16) -> str:
     """Generate a cryptographically random password meeting all complexity requirements."""
     # Ensure at least one character from each required class
     chars = []
-    if PASSWORD_REQUIRE_UPPER:
+    if cfg["password_require_upper"]:
         chars.append(secrets.choice(string.ascii_uppercase))
-    if PASSWORD_REQUIRE_LOWER:
+    if cfg["password_require_lower"]:
         chars.append(secrets.choice(string.ascii_lowercase))
-    if PASSWORD_REQUIRE_DIGIT:
+    if cfg["password_require_digit"]:
         chars.append(secrets.choice(string.digits))
-    if PASSWORD_REQUIRE_SPECIAL:
+    if cfg["password_require_special"]:
         chars.append(secrets.choice("!@#$%^&*()_+-=[]{}|;:,.<>?"))
 
     # Fill remaining length with random chars from the full set
@@ -356,6 +483,8 @@ def create_ad_user(params: dict) -> tuple:
     password = params["password"]
     force_change = "$true" if params.get("force_change", True) else "$false"
 
+    ad_domain = cfg["ad_domain"]
+
     script = f"""
     Import-Module ActiveDirectory
     $secpw = ConvertTo-SecureString -String '{password}' -AsPlainText -Force
@@ -365,7 +494,7 @@ def create_ad_user(params: dict) -> tuple:
       -Surname '{p["last_name"]}' `
       -DisplayName '{p["display_name"]}' `
       -SamAccountName '{p["username"]}' `
-      -UserPrincipalName '{p["username"]}@{AD_DOMAIN}' `
+      -UserPrincipalName '{p["username"]}@{ad_domain}' `
       -EmailAddress '{p["email"]}' `
       -Title '{p.get("title", "")}' `
       -Department '{p.get("department", "")}' `
@@ -480,25 +609,57 @@ def get_graph_token() -> str:
     """
     Acquire an app-only access token using certificate-based auth.
     Caches the token and re-acquires if near expiry.
+
+    Tries to load the private key in this order:
+      1. DPAPI-protected file (.protected extension)
+      2. Plain PEM file (fallback for initial setup before encryption)
     """
     now = time.time()
     if _graph_token_cache["token"] and _graph_token_cache["expires_at"] > now + 300:
         return _graph_token_cache["token"]
 
-    try:
-        with open(GRAPH_CERT_PATH, "r") as f:
-            cert_data = f.read()
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"Certificate not found at {GRAPH_CERT_PATH}. "
-            "Create an App Registration certificate and place the PEM file there."
-        )
+    cert_path = cfg["graph_cert_path"]
+    protected_path = cert_path + ".protected" if not cert_path.endswith(".protected") else cert_path
+
+    # Derive the plain PEM path from the protected path
+    if protected_path.endswith(".protected"):
+        plain_path = protected_path[:-len(".protected")]
+    else:
+        plain_path = cert_path
+
+    # Try DPAPI-protected file first
+    cert_data = None
+    if os.path.isfile(protected_path):
+        try:
+            cert_data = dpapi_decrypt_to_memory(protected_path)
+            logger.info("Loaded certificate via DPAPI decryption")
+        except RuntimeError as e:
+            logger.warning("DPAPI decryption failed, trying plain PEM: %s", e)
+
+    # Fall back to plain PEM file
+    if cert_data is None:
+        if os.path.isfile(plain_path):
+            try:
+                with open(plain_path, "r") as f:
+                    cert_data = f.read()
+                logger.info("Loaded certificate from plain PEM (not yet DPAPI-encrypted)")
+            except OSError as e:
+                raise RuntimeError(
+                    f"Cannot read certificate at {plain_path}: {e}"
+                )
+        else:
+            raise RuntimeError(
+                f"Certificate not found. Looked for:\n"
+                f"  - {protected_path} (DPAPI-encrypted)\n"
+                f"  - {plain_path} (plain PEM)\n"
+                "Run the Setup Wizard or generate a certificate first."
+            )
 
     app = msal.ConfidentialClientApplication(
-        client_id=GRAPH_CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}",
+        client_id=cfg["graph_client_id"],
+        authority=f"https://login.microsoftonline.com/{cfg['graph_tenant_id']}",
         client_credential={
-            "thumbprint": GRAPH_CERT_THUMBPRINT,
+            "thumbprint": cfg["graph_cert_thumbprint"],
             "private_key": cert_data,
         },
     )
@@ -542,7 +703,8 @@ def get_available_licenses() -> list:
     licenses = []
 
     # Build reverse lookup from our config for friendly names
-    sku_id_to_friendly = {v: k for k, v in LICENSE_SKUS.items()}
+    license_skus = cfg.get("license_skus", {})
+    sku_id_to_friendly = {v: k for k, v in license_skus.items()}
 
     for sku in skus:
         if sku.get("appliesTo") != "User":
@@ -734,7 +896,7 @@ def detect_sync_server() -> tuple:
     Auto-detect the server running Azure AD Connect / Entra Connect.
 
     Detection order:
-      1. Use ADSYNC_SERVER constant if set
+      1. Use configured adsync_server if set
       2. Check if ADSync service is running locally
       3. Query AD Service Connection Point for Entra Connect registration
       4. Scan domain controllers for ADSync service
@@ -742,10 +904,11 @@ def detect_sync_server() -> tuple:
     Returns:
         (server: str or None, method: str) — server hostname and detection method
     """
-    # Check override constant first
-    if ADSYNC_SERVER:
-        logger.info("Using configured sync server: %s", ADSYNC_SERVER)
-        return ADSYNC_SERVER, "configured"
+    # Check override from config first
+    adsync_server = cfg.get("adsync_server")
+    if adsync_server:
+        logger.info("Using configured sync server: %s", adsync_server)
+        return adsync_server, "configured"
 
     # Check if cached from prior detection
     if _detected_sync_server["checked"]:
@@ -869,6 +1032,579 @@ def trigger_delta_sync(server: str = None) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CERTIFICATE GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_certificate_on_dc(cert_path: str = None) -> tuple:
+    """
+    Generate a self-signed certificate on the DC for Graph API authentication.
+    Exports private key as PEM and public key as CER.
+    After generation, auto-encrypts the PEM with DPAPI and deletes plaintext.
+
+    Args:
+        cert_path: Override path for the PEM file. If None, uses cfg["graph_cert_path"].
+
+    Returns:
+        (success: bool, thumbprint: str, message: str)
+    """
+    if cert_path is None:
+        cert_path = cfg.get("graph_cert_path", r"C:\Certs\graph_app.pem")
+
+    # If the path ends with .protected, derive the plain PEM path for generation
+    if cert_path.endswith(".protected"):
+        pem_path = cert_path[:-len(".protected")]
+    else:
+        pem_path = cert_path
+
+    cert_dir = os.path.dirname(pem_path)
+    cer_path = pem_path.replace(".pem", ".cer")
+    protected_path = pem_path + ".protected"
+
+    script = f"""
+    # Create certificate directory
+    New-Item -ItemType Directory -Force -Path '{cert_dir}' | Out-Null
+
+    # Generate self-signed certificate (2-year expiry)
+    $cert = New-SelfSignedCertificate `
+      -Subject 'CN=UserProvisioningTool' `
+      -FriendlyName 'User Provisioning Tool - Graph API' `
+      -CertStoreLocation 'Cert:\\CurrentUser\\My' `
+      -KeyExportPolicy Exportable `
+      -KeySpec Signature `
+      -KeyLength 2048 `
+      -KeyAlgorithm RSA `
+      -HashAlgorithm SHA256 `
+      -NotAfter (Get-Date).AddYears(2)
+
+    # Export public key as CER (for uploading to Azure)
+    Export-Certificate -Cert $cert -FilePath '{cer_path}' -Force | Out-Null
+
+    # Export private key as PEM using .NET
+    # Get the RSA private key
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $privKeyBytes = $rsa.ExportRSAPrivateKey()
+    $privKeyPem = "-----BEGIN RSA PRIVATE KEY-----`r`n"
+    $privKeyPem += [Convert]::ToBase64String($privKeyBytes, 'InsertLineBreaks')
+    $privKeyPem += "`r`n-----END RSA PRIVATE KEY-----"
+
+    # Also include the certificate (public key) in the PEM for MSAL
+    $certBytes = $cert.Export('Cert')
+    $certPem = "-----BEGIN CERTIFICATE-----`r`n"
+    $certPem += [Convert]::ToBase64String($certBytes, 'InsertLineBreaks')
+    $certPem += "`r`n-----END CERTIFICATE-----"
+
+    $fullPem = $privKeyPem + "`r`n" + $certPem
+    Set-Content -Path '{pem_path}' -Value $fullPem -Encoding ASCII
+
+    # Output thumbprint and paths for the caller
+    $result = @{{
+      thumbprint = $cert.Thumbprint
+      pem_path = '{pem_path}'
+      cer_path = '{cer_path}'
+      expiry = $cert.NotAfter.ToString('yyyy-MM-dd')
+      subject = $cert.Subject
+    }}
+    $result | ConvertTo-Json -Compress
+    """
+
+    logger.info("Generating self-signed certificate for Graph API...")
+    success, stdout, stderr = run_powershell(script, timeout=30)
+
+    if not success:
+        logger.error("Certificate generation failed: %s", stderr)
+        return False, "", f"Failed to generate certificate: {stderr[:300]}"
+
+    try:
+        data = json.loads(stdout)
+        thumbprint = data.get("thumbprint", "")
+        logger.info("Certificate generated — thumbprint: %s", thumbprint)
+    except json.JSONDecodeError:
+        return False, "", f"Certificate may have been created but could not parse output: {stdout[:200]}"
+
+    # Auto-encrypt the PEM with DPAPI
+    encrypt_success, encrypt_msg = dpapi_encrypt_file(pem_path, protected_path)
+    if encrypt_success:
+        logger.info("PEM auto-encrypted with DPAPI: %s", protected_path)
+        encrypt_note = f"  Private key: {protected_path} (DPAPI-encrypted)\n"
+    else:
+        logger.warning("DPAPI encryption failed: %s", encrypt_msg)
+        encrypt_note = (
+            f"  Private key: {pem_path} (WARNING: not encrypted)\n"
+            f"  DPAPI encryption failed: {encrypt_msg}\n"
+        )
+
+    return True, thumbprint, (
+        f"Certificate generated successfully!\n\n"
+        f"  Thumbprint:  {thumbprint}\n"
+        f"{encrypt_note}"
+        f"  Public key:  {data.get('cer_path', cer_path)}\n"
+        f"  Expires:     {data.get('expiry', 'unknown')}\n\n"
+        f"NEXT STEPS:\n"
+        f"  1. Upload {cer_path} to your App Registration:\n"
+        f"     portal.azure.com > Entra ID > App registrations >\n"
+        f"     your app > Certificates & secrets > Upload certificate\n\n"
+        f"  2. The thumbprint has been recorded: {thumbprint}\n\n"
+        f"  3. Click 'Retry' to re-run preflight checks."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SETUP WIZARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SetupWizard(tk.Toplevel):
+    """
+    First-run setup wizard that collects customer-specific configuration
+    and writes config.json. Presented as a multi-page dialog.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.title("Setup Wizard — 365 User Provisioning")
+        self.geometry("700x620")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self._completed = False
+        self._current_page = 0
+        self._collected = {}
+
+        # Variables for wizard fields
+        self.ad_domain_var = tk.StringVar()
+        self.ad_netbios_var = tk.StringVar()
+        self.email_domains_var = tk.StringVar()
+        self.tenant_id_var = tk.StringVar()
+        self.client_id_var = tk.StringVar()
+        self.cert_thumbprint_var = tk.StringVar()
+        self.cert_path_var = tk.StringVar(value=r"C:\Certs\graph_app.pem.protected")
+
+        self._pages = []
+        self._build_ui()
+        self._show_page(0)
+
+        # Auto-detect domain in background
+        self.after(200, self._auto_detect_domain)
+
+    def _build_ui(self):
+        """Build the wizard UI with page container and navigation."""
+        # Header
+        self._header_label = ttk.Label(
+            self, text="", font=("Segoe UI", 13, "bold"))
+        self._header_label.pack(pady=(12, 2))
+
+        self._subheader_label = ttk.Label(
+            self, text="", foreground="gray", font=("Segoe UI", 9))
+        self._subheader_label.pack(pady=(0, 8))
+
+        # Page container
+        self._page_frame = ttk.Frame(self, padding=15)
+        self._page_frame.pack(fill="both", expand=True)
+
+        # Build all pages (hidden initially)
+        self._build_page_domain()
+        self._build_page_m365()
+        self._build_page_certificate()
+        self._build_page_review()
+
+        # Navigation buttons
+        nav_frame = ttk.Frame(self, padding=(15, 8))
+        nav_frame.pack(fill="x")
+
+        self._back_btn = ttk.Button(nav_frame, text="Back", command=self._go_back)
+        self._back_btn.pack(side="left", padx=5)
+
+        self._next_btn = ttk.Button(nav_frame, text="Next", command=self._go_next)
+        self._next_btn.pack(side="left", padx=5)
+
+        ttk.Button(nav_frame, text="Cancel", command=self._on_cancel).pack(
+            side="right", padx=5)
+
+    def _build_page_domain(self):
+        """Page 1: Domain Settings."""
+        page = ttk.Frame(self._page_frame)
+        self._pages.append(("Domain Settings", "Step 1 of 4", page))
+
+        ttk.Label(page, text="AD Domain FQDN *", font=("Segoe UI", 10)).grid(
+            row=0, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.ad_domain_var, width=40).grid(
+            row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="e.g. contoso.com (will be auto-detected if possible)",
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=2, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(page, text="AD NetBIOS Name *", font=("Segoe UI", 10)).grid(
+            row=3, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.ad_netbios_var, width=25).grid(
+            row=4, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="e.g. CONTOSO (will be auto-detected if possible)",
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=5, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(page, text="Email Domains (comma-separated) *",
+                  font=("Segoe UI", 10)).grid(
+            row=6, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.email_domains_var, width=50).grid(
+            row=7, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="e.g. contoso.com, fabrikam.com",
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=8, column=0, sticky="w")
+
+        self._domain_detect_label = ttk.Label(page, text="", foreground="gray")
+        self._domain_detect_label.grid(row=9, column=0, sticky="w", pady=(15, 0))
+
+    def _build_page_m365(self):
+        """Page 2: Microsoft 365 / Entra ID settings."""
+        page = ttk.Frame(self._page_frame)
+        self._pages.append(("Microsoft 365 / Entra ID", "Step 2 of 4", page))
+
+        ttk.Label(page, text="Tenant ID (Directory ID) *",
+                  font=("Segoe UI", 10)).grid(
+            row=0, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.tenant_id_var, width=45).grid(
+            row=1, column=0, sticky="w", pady=(0, 8))
+
+        ttk.Label(page, text="Client ID (Application ID) *",
+                  font=("Segoe UI", 10)).grid(
+            row=2, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.client_id_var, width=45).grid(
+            row=3, column=0, sticky="w", pady=(0, 12))
+
+        # Instructions panel
+        instructions_frame = ttk.LabelFrame(page, text=" How to get these values ",
+                                             padding=8)
+        instructions_frame.grid(row=4, column=0, sticky="ew", pady=(5, 0))
+
+        instructions = scrolledtext.ScrolledText(
+            instructions_frame, wrap="word", font=("Consolas", 8),
+            height=12, bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="normal")
+        instructions.pack(fill="both", expand=True)
+
+        instructions.insert("1.0", (
+            "CREATE AN APP REGISTRATION\n"
+            "==========================\n\n"
+            "1. Sign in to portal.azure.com as a Global Admin\n"
+            "2. Go to: Entra ID > App registrations > New registration\n"
+            "3. Name: 'User Provisioning Tool'\n"
+            "4. Supported account types: 'This organizational directory only'\n"
+            "5. Click Register\n\n"
+            "FROM THE OVERVIEW PAGE:\n"
+            "  - Application (client) ID  -->  Client ID above\n"
+            "  - Directory (tenant) ID    -->  Tenant ID above\n\n"
+            "GRANT API PERMISSIONS:\n"
+            "  1. API permissions > Add a permission > Microsoft Graph\n"
+            "  2. Application permissions > add:\n"
+            "     - User.ReadWrite.All\n"
+            "     - Directory.ReadWrite.All\n"
+            "     - Organization.Read.All\n"
+            "     - Group.ReadWrite.All\n"
+            "     - GroupMember.ReadWrite.All\n"
+            "  3. Click 'Grant admin consent' (requires Global Admin)\n\n"
+            "You will upload the certificate in the next step."
+        ))
+        instructions.configure(state="disabled")
+
+    def _build_page_certificate(self):
+        """Page 3: Certificate generation and configuration."""
+        page = ttk.Frame(self._page_frame)
+        self._pages.append(("Certificate", "Step 3 of 4", page))
+
+        ttk.Label(page, text=(
+            "A certificate is needed to authenticate to Microsoft 365.\n"
+            "Click 'Generate Certificate' to create one automatically."),
+            font=("Segoe UI", 10), wraplength=600, justify="left").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        self._gen_cert_wizard_btn = ttk.Button(
+            page, text="Generate Certificate", command=self._on_wizard_generate_cert)
+        self._gen_cert_wizard_btn.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self._cert_status_label = ttk.Label(page, text="", foreground="gray",
+                                             wraplength=600)
+        self._cert_status_label.grid(row=2, column=0, columnspan=2, sticky="w",
+                                      pady=(0, 12))
+
+        ttk.Label(page, text="Certificate Thumbprint *",
+                  font=("Segoe UI", 10)).grid(
+            row=3, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.cert_thumbprint_var, width=50).grid(
+            row=4, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="Auto-filled after generation, or enter manually",
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=5, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(page, text="Certificate Path",
+                  font=("Segoe UI", 10)).grid(
+            row=6, column=0, sticky="w", pady=(0, 2))
+        ttk.Entry(page, textvariable=self.cert_path_var, width=55).grid(
+            row=7, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(page, text="Path to the DPAPI-encrypted .pem.protected file",
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=8, column=0, sticky="w")
+
+        # Instructions for Azure upload
+        ttk.Label(page, text=(
+            "\nAfter generating, upload the .cer file to Azure:\n"
+            "  portal.azure.com > Entra ID > App registrations >\n"
+            "  your app > Certificates & secrets > Upload certificate"),
+            foreground="gray", font=("Segoe UI", 9), wraplength=600,
+            justify="left").grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _build_page_review(self):
+        """Page 4: Review and save."""
+        page = ttk.Frame(self._page_frame)
+        self._pages.append(("Review & Save", "Step 4 of 4", page))
+
+        ttk.Label(page, text="Review your configuration before saving:",
+                  font=("Segoe UI", 10)).grid(
+            row=0, column=0, sticky="w", pady=(0, 8))
+
+        self._review_text = scrolledtext.ScrolledText(
+            page, wrap="word", font=("Consolas", 9),
+            height=16, bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="disabled")
+        self._review_text.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        page.rowconfigure(1, weight=1)
+        page.columnconfigure(0, weight=1)
+
+        self._save_btn = ttk.Button(page, text="Save Configuration",
+                                     command=self._on_save)
+        self._save_btn.grid(row=2, column=0, sticky="w", pady=(0, 5))
+
+        self._save_status_label = ttk.Label(page, text="", foreground="gray")
+        self._save_status_label.grid(row=3, column=0, sticky="w")
+
+    def _show_page(self, index: int):
+        """Display the specified wizard page."""
+        # Hide all pages
+        for _, _, page_frame in self._pages:
+            page_frame.pack_forget()
+
+        self._current_page = index
+        title, subtitle, page_frame = self._pages[index]
+        self._header_label.configure(text=title)
+        self._subheader_label.configure(text=subtitle)
+        page_frame.pack(fill="both", expand=True)
+
+        # Update nav button states
+        self._back_btn.configure(state="normal" if index > 0 else "disabled")
+
+        if index == len(self._pages) - 1:
+            self._next_btn.configure(state="disabled")
+            self._populate_review()
+        else:
+            self._next_btn.configure(state="normal")
+
+    def _go_next(self):
+        if self._current_page < len(self._pages) - 1:
+            self._show_page(self._current_page + 1)
+
+    def _go_back(self):
+        if self._current_page > 0:
+            self._show_page(self._current_page - 1)
+
+    def _auto_detect_domain(self):
+        """Try to auto-detect AD domain and NetBIOS from the current machine."""
+        self._domain_detect_label.configure(text="Detecting domain...",
+                                             foreground="blue")
+
+        def detect():
+            script = """
+            try {
+              Import-Module ActiveDirectory -ErrorAction Stop
+              $d = Get-ADDomain
+              $result = @{
+                fqdn = $d.DNSRoot
+                netbios = $d.NetBIOSName
+              }
+              $result | ConvertTo-Json -Compress
+            } catch {
+              Write-Output '{}'
+            }
+            """
+            return run_powershell(script, timeout=15)
+
+        def on_result(result):
+            success, stdout, _ = result
+            if success and stdout and stdout != "{}":
+                try:
+                    data = json.loads(stdout)
+                    fqdn = data.get("fqdn", "")
+                    netbios = data.get("netbios", "")
+                    if fqdn and not self.ad_domain_var.get():
+                        self.ad_domain_var.set(fqdn)
+                    if netbios and not self.ad_netbios_var.get():
+                        self.ad_netbios_var.set(netbios)
+                    if fqdn and not self.email_domains_var.get():
+                        self.email_domains_var.set(fqdn)
+                    self._domain_detect_label.configure(
+                        text=f"Auto-detected: {fqdn} ({netbios})",
+                        foreground="green")
+                    return
+                except json.JSONDecodeError:
+                    pass
+            self._domain_detect_label.configure(
+                text="Could not auto-detect domain. Enter values manually.",
+                foreground="orange")
+
+        def wrapper():
+            try:
+                result = detect()
+                self.after(0, on_result, result)
+            except Exception:
+                self.after(0, lambda: self._domain_detect_label.configure(
+                    text="Auto-detection failed. Enter values manually.",
+                    foreground="orange"))
+
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _on_wizard_generate_cert(self):
+        """Generate a certificate from the wizard."""
+        self._gen_cert_wizard_btn.configure(state="disabled", text="Generating...")
+        self._cert_status_label.configure(text="Generating certificate...",
+                                           foreground="blue")
+
+        # Derive the PEM path (without .protected) for generation
+        cert_path = self.cert_path_var.get().strip()
+        if not cert_path:
+            cert_path = r"C:\Certs\graph_app.pem.protected"
+            self.cert_path_var.set(cert_path)
+
+        def do_gen():
+            return generate_certificate_on_dc(cert_path)
+
+        def on_done(result):
+            success, thumbprint, message = result
+            self._gen_cert_wizard_btn.configure(
+                state="normal", text="Generate Certificate")
+            if success:
+                self.cert_thumbprint_var.set(thumbprint)
+                self._cert_status_label.configure(
+                    text=f"Certificate generated. Thumbprint: {thumbprint}",
+                    foreground="green")
+            else:
+                self._cert_status_label.configure(
+                    text=f"Failed: {message[:200]}", foreground="red")
+
+        def wrapper():
+            try:
+                result = do_gen()
+                self.after(0, on_done, result)
+            except Exception as e:
+                self.after(0, lambda: self._cert_status_label.configure(
+                    text=f"Error: {e}", foreground="red"))
+                self.after(0, lambda: self._gen_cert_wizard_btn.configure(
+                    state="normal", text="Generate Certificate"))
+
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _populate_review(self):
+        """Fill the review page with collected values."""
+        email_domains = [d.strip() for d in self.email_domains_var.get().split(",")
+                         if d.strip()]
+
+        review = (
+            f"AD Domain:        {self.ad_domain_var.get()}\n"
+            f"AD NetBIOS:       {self.ad_netbios_var.get()}\n"
+            f"Email Domains:    {', '.join(email_domains)}\n"
+            f"\n"
+            f"Tenant ID:        {self.tenant_id_var.get()}\n"
+            f"Client ID:        {self.client_id_var.get()}\n"
+            f"Cert Thumbprint:  {self.cert_thumbprint_var.get()}\n"
+            f"Cert Path:        {self.cert_path_var.get()}\n"
+            f"\n"
+            f"Config will be saved to:\n"
+            f"  {CONFIG_PATH}\n"
+            f"\n"
+            f"AFTER SAVING:\n"
+            f"  1. Upload the .cer file to your App Registration in Azure\n"
+            f"  2. Grant admin consent on the API permissions\n"
+            f"  3. Re-run the preflight checks"
+        )
+
+        self._review_text.configure(state="normal")
+        self._review_text.delete("1.0", "end")
+        self._review_text.insert("1.0", review)
+        self._review_text.configure(state="disabled")
+
+    def _on_save(self):
+        """Validate and save config.json."""
+        # Validate required fields
+        errors = []
+        if not self.ad_domain_var.get().strip():
+            errors.append("AD Domain is required")
+        if not self.ad_netbios_var.get().strip():
+            errors.append("AD NetBIOS name is required")
+        if not self.email_domains_var.get().strip():
+            errors.append("At least one email domain is required")
+        if not self.tenant_id_var.get().strip():
+            errors.append("Tenant ID is required")
+        if not self.client_id_var.get().strip():
+            errors.append("Client ID is required")
+        if not self.cert_thumbprint_var.get().strip():
+            errors.append("Certificate thumbprint is required")
+
+        if errors:
+            messagebox.showerror("Validation Error",
+                                 "\n".join(f"- {e}" for e in errors))
+            return
+
+        email_domains = [d.strip() for d in self.email_domains_var.get().split(",")
+                         if d.strip()]
+
+        config_data = {
+            "ad_domain": self.ad_domain_var.get().strip(),
+            "ad_netbios": self.ad_netbios_var.get().strip(),
+            "email_domains": email_domains,
+            "adsync_server": None,
+            "graph_tenant_id": self.tenant_id_var.get().strip(),
+            "graph_client_id": self.client_id_var.get().strip(),
+            "graph_cert_thumbprint": self.cert_thumbprint_var.get().strip(),
+            "graph_cert_path": self.cert_path_var.get().strip(),
+            "password_min_length": DEFAULTS["password_min_length"],
+            "password_require_upper": DEFAULTS["password_require_upper"],
+            "password_require_lower": DEFAULTS["password_require_lower"],
+            "password_require_digit": DEFAULTS["password_require_digit"],
+            "password_require_special": DEFAULTS["password_require_special"],
+            "entra_poll_interval_seconds": DEFAULTS["entra_poll_interval_seconds"],
+            "entra_poll_timeout_seconds": DEFAULTS["entra_poll_timeout_seconds"],
+        }
+
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=2)
+            logger.info("config.json saved to %s", CONFIG_PATH)
+        except OSError as e:
+            messagebox.showerror("Save Error", f"Could not write config.json:\n{e}")
+            return
+
+        # Reload config into the global cfg dict
+        global cfg
+        cfg = load_config()
+
+        self._save_status_label.configure(
+            text=f"Saved to {CONFIG_PATH}", foreground="green")
+        self._completed = True
+
+        messagebox.showinfo(
+            "Configuration Saved",
+            f"config.json has been saved.\n\n"
+            f"Next steps:\n"
+            f"1. Upload the .cer file to your App Registration in Azure\n"
+            f"2. Grant admin consent on the API permissions\n"
+            f"3. Close this wizard and click 'Retry All Checks'"
+        )
+        self.destroy()
+
+    def _on_cancel(self):
+        self.destroy()
+
+    @property
+    def completed(self) -> bool:
+        return self._completed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  GUI APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -877,7 +1613,11 @@ class ProvisioningApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title(WINDOW_TITLE)
+        domain_display = cfg.get("ad_domain", "")
+        if domain_display:
+            self.title(f"365 User Provisioning \u2014 {domain_display}")
+        else:
+            self.title("365 User Provisioning Tool")
         self.geometry(WINDOW_SIZE)
         self.resizable(True, True)
 
@@ -900,7 +1640,7 @@ class ProvisioningApp(tk.Tk):
         # Load data from AD and Graph in background threads
         self.after(100, self._load_startup_data)
 
-    # ── UI Construction ───────────────────────────────────────────────────
+    # -- UI Construction ---------------------------------------------------
 
     def _build_ui(self):
         """Construct the full GUI layout."""
@@ -932,15 +1672,17 @@ class ProvisioningApp(tk.Tk):
         parent = self._scroll_frame
         pad = {"padx": 10, "pady": 5}
 
-        # ── User Information ──────────────────────────────────────────────
+        # -- User Information ----------------------------------------------
         frame_user = ttk.LabelFrame(parent, text=" User Information ", padding=10)
         frame_user.pack(fill="x", **pad)
 
+        email_domains = cfg.get("email_domains", [])
         self.first_name_var = tk.StringVar()
         self.last_name_var = tk.StringVar()
         self.display_name_var = tk.StringVar()
         self.username_var = tk.StringVar()
-        self.email_domain_var = tk.StringVar(value=EMAIL_DOMAINS[0] if EMAIL_DOMAINS else "")
+        self.email_domain_var = tk.StringVar(
+            value=email_domains[0] if email_domains else "")
         self.job_title_var = tk.StringVar()
         self.department_var = tk.StringVar()
 
@@ -974,7 +1716,7 @@ class ProvisioningApp(tk.Tk):
         # Row 3: Email Domain
         ttk.Label(frame_user, text="Email Domain *").grid(row=3, column=0, sticky="w", pady=(5, 0))
         email_combo = ttk.Combobox(frame_user, textvariable=self.email_domain_var,
-                                    values=EMAIL_DOMAINS, width=25, state="readonly")
+                                    values=email_domains, width=25, state="readonly")
         email_combo.grid(row=3, column=1, sticky="w", pady=(5, 0))
 
         # Row 4: Job Title / Department
@@ -985,7 +1727,7 @@ class ProvisioningApp(tk.Tk):
         ttk.Entry(frame_user, textvariable=self.department_var, width=25).grid(
             row=4, column=3, sticky="w", pady=(5, 0))
 
-        # ── Active Directory ──────────────────────────────────────────────
+        # -- Active Directory ----------------------------------------------
         frame_ad = ttk.LabelFrame(parent, text=" Active Directory ", padding=10)
         frame_ad.pack(fill="x", **pad)
 
@@ -1034,7 +1776,7 @@ class ProvisioningApp(tk.Tk):
         self.manager_results_listbox.bind("<<ListboxSelect>>", self._on_manager_select)
         self._manager_results = []  # list of (display, dn)
 
-        # ── Cloud Groups (Entra ID) ──────────────────────────────────────
+        # -- Cloud Groups (Entra ID) --------------------------------------
         frame_cloud = ttk.LabelFrame(parent, text=" Cloud Groups (Entra ID Only) ", padding=10)
         frame_cloud.pack(fill="x", **pad)
 
@@ -1056,7 +1798,7 @@ class ProvisioningApp(tk.Tk):
         self.cloud_groups_status = ttk.Label(frame_cloud, text="Loading...", foreground="gray")
         self.cloud_groups_status.grid(row=1, column=1, sticky="w")
 
-        # ── Password ─────────────────────────────────────────────────────
+        # -- Password ------------------------------------------------------
         frame_pw = ttk.LabelFrame(parent, text=" Password ", padding=10)
         frame_pw.pack(fill="x", **pad)
 
@@ -1093,7 +1835,7 @@ class ProvisioningApp(tk.Tk):
                          variable=self.force_change_var).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
-        # ── Microsoft 365 Licensing ──────────────────────────────────────
+        # -- Microsoft 365 Licensing ---------------------------------------
         frame_lic = ttk.LabelFrame(parent, text=" Microsoft 365 Licensing ", padding=10)
         frame_lic.pack(fill="x", **pad)
 
@@ -1119,7 +1861,7 @@ class ProvisioningApp(tk.Tk):
         self.service_plans_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
         self._service_plan_vars = {}  # plan_id -> BooleanVar (True = disabled)
 
-        # ── Sync Server Status ───────────────────────────────────────────
+        # -- Sync Server Status --------------------------------------------
         frame_sync = ttk.LabelFrame(parent, text=" Entra Connect Sync ", padding=10)
         frame_sync.pack(fill="x", **pad)
 
@@ -1140,7 +1882,7 @@ class ProvisioningApp(tk.Tk):
                          variable=self.skip_sync_var).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
-        # ── Action Buttons ───────────────────────────────────────────────
+        # -- Action Buttons ------------------------------------------------
         frame_actions = ttk.Frame(parent, padding=10)
         frame_actions.pack(fill="x", padx=10)
 
@@ -1153,7 +1895,7 @@ class ProvisioningApp(tk.Tk):
                                       command=self._on_cancel_click)
         self.cancel_btn.pack(side="left", padx=(10, 0))
 
-        # ── Progress & Status ────────────────────────────────────────────
+        # -- Progress & Status ---------------------------------------------
         status_frame = ttk.Frame(self, padding=(10, 5))
         status_frame.pack(fill="x", side="bottom")
 
@@ -1162,7 +1904,7 @@ class ProvisioningApp(tk.Tk):
         self.status_label = ttk.Label(status_frame, text="Ready", foreground="gray")
         self.status_label.pack(fill="x", pady=(2, 0))
 
-    # ── Startup Data Loading ─────────────────────────────────────────────
+    # -- Startup Data Loading ----------------------------------------------
 
     def _load_startup_data(self):
         """Load AD and Graph data in background threads on startup."""
@@ -1198,7 +1940,7 @@ class ProvisioningApp(tk.Tk):
             display = g.get("name", "")
             desc = g.get("description", "")
             if desc:
-                display = f"{display} — {desc[:40]}"
+                display = f"{display} \u2014 {desc[:40]}"
             self.ad_groups_listbox.insert("end", display)
             self._ad_group_map[i] = g.get("dn", "")
 
@@ -1237,7 +1979,7 @@ class ProvisioningApp(tk.Tk):
 
     def _populate_licenses(self, licenses):
         self._licenses = licenses
-        values = ["(None — skip licensing)"]
+        values = ["(None \u2014 skip licensing)"]
         for lic in licenses:
             values.append(f"{lic['friendly_name']} ({lic['available']}/{lic['total']} available)")
         self.license_combo["values"] = values
@@ -1255,9 +1997,9 @@ class ProvisioningApp(tk.Tk):
                 text=f"Detected: {server} (via {method})", foreground="green")
         else:
             self.sync_server_label.configure(
-                text="Not detected — enter manually or skip sync", foreground="orange")
+                text="Not detected \u2014 enter manually or skip sync", foreground="orange")
 
-    # ── Event Handlers ───────────────────────────────────────────────────
+    # -- Event Handlers ----------------------------------------------------
 
     def _on_name_change(self, *_args):
         """Auto-generate display name and username when first/last name changes."""
@@ -1312,12 +2054,13 @@ class ProvisioningApp(tk.Tk):
                 foreground="green")
         else:
             self.license_seats_label.configure(
-                text=f"0 available / {total} total — provision licenses in M365 admin center",
+                text=f"0 available / {total} total \u2014 provision licenses in M365 admin center",
                 foreground="red")
 
         # Show service plan checkbuttons
         plans = lic.get("service_plans", [])
-        default_disabled = DISABLED_SERVICE_PLANS.get(lic["sku_id"], [])
+        disabled_service_plans = cfg.get("disabled_service_plans", {})
+        default_disabled = disabled_service_plans.get(lic["sku_id"], [])
 
         ttk.Label(self.service_plans_frame, text="Disable service plans:").grid(
             row=0, column=0, columnspan=3, sticky="w")
@@ -1345,7 +2088,7 @@ class ProvisioningApp(tk.Tk):
             self.manager_display_var.set(f"-> {display}")
             self.manager_results_listbox.grid_remove()
 
-    # ── Actions ──────────────────────────────────────────────────────────
+    # -- Actions -----------------------------------------------------------
 
     def _check_username(self):
         """Check username availability in AD."""
@@ -1439,7 +2182,7 @@ class ProvisioningApp(tk.Tk):
         self._cancel_event.set()
         self._update_status("Cancelling...")
 
-    # ── Validation ───────────────────────────────────────────────────────
+    # -- Validation --------------------------------------------------------
 
     def _validate_all(self) -> tuple:
         """
@@ -1488,7 +2231,7 @@ class ProvisioningApp(tk.Tk):
 
         return len(errors) == 0, errors
 
-    # ── Provisioning Workflow ────────────────────────────────────────────
+    # -- Provisioning Workflow ---------------------------------------------
 
     def _on_provision_click(self):
         """Validate and start the provisioning workflow."""
@@ -1560,7 +2303,7 @@ class ProvisioningApp(tk.Tk):
             "force_change": self.force_change_var.get(),
         }
 
-        # ── Step 1: Create AD User ───────────────────────────────────────
+        # -- Step 1: Create AD User ----------------------------------------
         self._update_status_ts("Creating AD user...")
         if self._cancel_event.is_set():
             results["errors"].append("Cancelled by user")
@@ -1574,7 +2317,7 @@ class ProvisioningApp(tk.Tk):
         results["ad_created"] = True
         results["ad_user_dn"] = user_dn
 
-        # ── Step 2: Set Manager ──────────────────────────────────────────
+        # -- Step 2: Set Manager -------------------------------------------
         manager_dn = self.manager_dn_var.get()
         if manager_dn and user_dn:
             self._update_status_ts("Setting manager...")
@@ -1582,7 +2325,7 @@ class ProvisioningApp(tk.Tk):
             if not success:
                 results["errors"].append(f"Failed to set manager: {error}")
 
-        # ── Step 3: Add to AD Groups ─────────────────────────────────────
+        # -- Step 3: Add to AD Groups --------------------------------------
         selected_ad_groups = self.ad_groups_listbox.curselection()
         if selected_ad_groups and user_dn:
             self._update_status_ts("Adding to AD groups...")
@@ -1594,11 +2337,15 @@ class ProvisioningApp(tk.Tk):
                 if not gsuccess:
                     results["errors"].append(f"Group '{gname}': {gerror}")
 
-        # ── Step 4: License and Sync ─────────────────────────────────────
+        # -- Step 4: License and Sync --------------------------------------
         lic_selection = self.license_var.get()
         wants_license = lic_selection and not lic_selection.startswith("(None")
         selected_cloud_groups = self.cloud_groups_listbox.curselection()
         wants_cloud_groups = len(selected_cloud_groups) > 0
+
+        ad_domain = cfg["ad_domain"]
+        poll_interval = cfg["entra_poll_interval_seconds"]
+        poll_timeout = cfg["entra_poll_timeout_seconds"]
 
         # Only sync/poll if we need to do something in Entra
         if wants_license or wants_cloud_groups:
@@ -1616,25 +2363,25 @@ class ProvisioningApp(tk.Tk):
                 if not success:
                     results["errors"].append(f"Sync: {msg}")
             else:
-                self._update_status_ts("Sync skipped — waiting for user to appear in Entra...")
+                self._update_status_ts("Sync skipped \u2014 waiting for user to appear in Entra...")
                 results["sync_triggered"] = True  # Skipped intentionally
 
             # Poll for user in Entra ID
-            upn = f"{username}@{AD_DOMAIN}"
+            upn = f"{username}@{ad_domain}"
             self._update_status_ts("Waiting for user to appear in Entra ID...")
             start_time = time.time()
 
             while not self._cancel_event.is_set():
                 elapsed = time.time() - start_time
-                if elapsed > ENTRA_POLL_TIMEOUT_SECONDS:
+                if elapsed > poll_timeout:
                     results["errors"].append(
-                        f"User not found in Entra ID after {ENTRA_POLL_TIMEOUT_SECONDS}s. "
-                        "Sync may be delayed — assign license manually later."
+                        f"User not found in Entra ID after {poll_timeout}s. "
+                        "Sync may be delayed \u2014 assign license manually later."
                     )
                     break
 
                 self._update_status_ts(
-                    f"Polling Entra ID... ({int(elapsed)}s / {ENTRA_POLL_TIMEOUT_SECONDS}s)")
+                    f"Polling Entra ID... ({int(elapsed)}s / {poll_timeout}s)")
 
                 user_data = find_user_in_entra(upn)
                 if user_data:
@@ -1642,9 +2389,9 @@ class ProvisioningApp(tk.Tk):
                     results["entra_user_id"] = user_data.get("id", "")
                     break
 
-                time.sleep(ENTRA_POLL_INTERVAL_SECONDS)
+                time.sleep(poll_interval)
 
-            # ── Step 5: Assign License ───────────────────────────────────
+            # -- Step 5: Assign License ------------------------------------
             if results["entra_found"] and wants_license:
                 if self._cancel_event.is_set():
                     results["errors"].append("Cancelled by user")
@@ -1664,7 +2411,7 @@ class ProvisioningApp(tk.Tk):
                 if not success:
                     results["errors"].append(f"License assignment: {error}")
 
-            # ── Step 6: Add to Cloud Groups ──────────────────────────────
+            # -- Step 6: Add to Cloud Groups -------------------------------
             if results["entra_found"] and wants_cloud_groups:
                 if self._cancel_event.is_set():
                     results["errors"].append("Cancelled by user")
@@ -1737,7 +2484,7 @@ class ProvisioningApp(tk.Tk):
                              f"An unexpected error occurred:\n\n{error}")
         self._update_status("Error")
 
-    # ── Thread Helpers ───────────────────────────────────────────────────
+    # -- Thread Helpers ----------------------------------------------------
 
     def _run_in_thread(self, target, args=(), on_complete=None, on_error=None):
         """Run a function in a daemon thread with GUI-safe callbacks."""
@@ -1780,7 +2527,7 @@ CHECK_PASS = "pass"
 CHECK_WARN = "warn"
 CHECK_FAIL = "fail"
 
-# ── Remediation instructions for each check ──────────────────────────────
+# -- Remediation instructions for each check ----------------------------------
 # These are shown in detail when a check fails or warns. Written for an MSP
 # tech deploying this tool to a new customer DC for the first time.
 
@@ -1788,7 +2535,7 @@ REMEDIATION = {
     "powershell": {
         CHECK_FAIL: (
             "HOW TO FIX: PowerShell Not Available\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 36 + "\n"
             "This tool must run on a Windows machine with PowerShell.\n\n"
             "1. This EXE is designed to run on a Windows Domain Controller.\n"
             "2. If you're testing on a non-Windows machine, the tool won't work.\n"
@@ -1799,7 +2546,7 @@ REMEDIATION = {
     "ad_module": {
         CHECK_FAIL: (
             "HOW TO FIX: Active Directory PowerShell Module\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 46 + "\n"
             "The AD module is required to create users and query the domain.\n\n"
             "If running on a Domain Controller:\n"
             "  - The module should already be installed. Try:\n"
@@ -1817,7 +2564,7 @@ REMEDIATION = {
     "ad_permissions": {
         CHECK_FAIL: (
             "HOW TO FIX: AD Permissions\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 26 + "\n"
             "The current user cannot query Active Directory.\n\n"
             "1. Right-click the EXE and select 'Run as administrator'\n"
             "2. Ensure you are logged in as a Domain Admin, or an account with\n"
@@ -1834,103 +2581,79 @@ REMEDIATION = {
     "network": {
         CHECK_FAIL: (
             "HOW TO FIX: Network Connectivity\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 32 + "\n"
             "The DC must reach Microsoft cloud endpoints over HTTPS (port 443).\n\n"
             "Required endpoints:\n"
             "  - login.microsoftonline.com  (Entra ID authentication)\n"
             "  - graph.microsoft.com        (Microsoft Graph API)\n\n"
             "Troubleshooting:\n"
-            "1. Check firewall rules — port 443 outbound must be open to these hosts\n"
-            "2. Check proxy settings — if the DC uses a web proxy:\n"
+            "1. Check firewall rules \u2014 port 443 outbound must be open to these hosts\n"
+            "2. Check proxy settings \u2014 if the DC uses a web proxy:\n"
             "   netsh winhttp show proxy\n"
             "3. Test manually:\n"
             "   Test-NetConnection login.microsoftonline.com -Port 443\n"
             "   Test-NetConnection graph.microsoft.com -Port 443\n"
             "4. If using a proxy, set the system proxy:\n"
             "   netsh winhttp set proxy proxy-server:port\n"
-            "5. DNS resolution — verify the DC can resolve these hostnames:\n"
+            "5. DNS resolution \u2014 verify the DC can resolve these hostnames:\n"
             "   Resolve-DnsName login.microsoftonline.com"
         ),
     },
     "certificate": {
         CHECK_FAIL: (
             "HOW TO FIX: Graph API Certificate\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 33 + "\n"
             "A certificate is needed so this tool can authenticate to Microsoft 365\n"
             "without storing a password. Each customer needs their own certificate.\n\n"
-            "OPTION A — Generate Certificate (click 'Generate Cert' button below)\n"
-            "  The button will create a self-signed certificate automatically and\n"
-            "  place it at the expected path. You'll still need to upload the public\n"
-            "  key to Azure (see Step 2).\n\n"
-            "OPTION B — Generate Manually in PowerShell (Run as Admin)\n"
-            "  Step 1: Create the certificate\n"
-            "  ──────────────────────────────\n"
-            f"  mkdir '{os.path.dirname(GRAPH_CERT_PATH)}' -Force\n"
-            "  $cert = New-SelfSignedCertificate `\n"
-            "    -Subject 'CN=UserProvisioningTool' `\n"
-            "    -CertStoreLocation 'Cert:\\CurrentUser\\My' `\n"
-            "    -KeyExportPolicy Exportable `\n"
-            "    -KeySpec Signature `\n"
-            "    -KeyLength 2048 `\n"
-            "    -NotAfter (Get-Date).AddYears(2)\n\n"
-            "  # Export private key as PEM (for this tool)\n"
-            "  $pem = [Convert]::ToBase64String($cert.Export('Pfx',''), 'InsertLineBreaks')\n"
-            "  # NOTE: Use the 'Generate Cert' button for proper PEM export.\n\n"
-            "  # Export public key as CER (for Azure upload)\n"
-            "  Export-Certificate -Cert $cert -FilePath C:\\Certs\\graph_app.cer\n\n"
-            "  # Note the thumbprint — you'll need it for the config:\n"
-            "  Write-Host 'Thumbprint:' $cert.Thumbprint\n\n"
-            "  Step 2: Upload to Azure App Registration\n"
-            "  ─────────────────────────────────────────\n"
-            "  1. Go to: portal.azure.com > Entra ID > App registrations\n"
-            "  2. Find (or create) the 'User Provisioning Tool' app\n"
-            "  3. Go to: Certificates & secrets > Certificates > Upload certificate\n"
-            "  4. Upload the .cer file from C:\\Certs\\graph_app.cer\n"
-            "  5. Copy the thumbprint shown after upload\n\n"
-            "  Step 3: Update this tool's config\n"
-            "  ─────────────────────────────────\n"
-            f"  Edit the constants at the top of the script:\n"
-            f"  GRAPH_CERT_THUMBPRINT = '<thumbprint from step above>'\n"
-            f"  GRAPH_CERT_PATH = r'{GRAPH_CERT_PATH}'\n\n"
-            "  Then click 'Retry' to re-run checks."
+            "OPTION A \u2014 Generate Certificate (click 'Generate Cert' button below)\n"
+            "  The button will create a self-signed certificate automatically,\n"
+            "  DPAPI-encrypt the private key, and place it at the expected path.\n"
+            "  You'll still need to upload the public key (.cer) to Azure.\n\n"
+            "OPTION B \u2014 Run the Setup Wizard (click 'Run Setup Wizard' below)\n"
+            "  The wizard will walk you through generating a certificate and\n"
+            "  configuring all settings step by step.\n\n"
+            "After generating, update config.json with the thumbprint,\n"
+            "then click 'Retry' to re-run checks."
         ),
         CHECK_WARN: (
             "WARNING: Certificate File Issue\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "The file exists but may not be a valid PEM certificate.\n\n"
+            "\u2501" * 31 + "\n"
+            "The file exists but may not be a valid PEM certificate or\n"
+            "DPAPI-encrypted file.\n\n"
+            "Expected formats:\n"
+            "  - .pem.protected (DPAPI-encrypted, preferred)\n"
+            "  - .pem (plaintext PEM, will work but should be encrypted)\n\n"
             "A valid PEM file should start with:\n"
             "  -----BEGIN PRIVATE KEY-----\n"
             "  or\n"
             "  -----BEGIN RSA PRIVATE KEY-----\n\n"
-            "If the file is in PFX/PKCS12 format, convert it:\n"
-            "  openssl pkcs12 -in cert.pfx -out graph_app.pem -nodes\n\n"
-            "Or use the 'Generate Cert' button to create a new valid PEM."
+            "Use the 'Generate Cert' button to create a new valid certificate."
         ),
     },
     "graph_auth": {
         CHECK_FAIL: (
             "HOW TO FIX: Microsoft 365 Login\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 31 + "\n"
             "The tool could not authenticate to this customer's Microsoft 365 tenant.\n\n"
             "For each customer, you need an App Registration in THEIR Entra ID tenant.\n\n"
             "  Step 1: Create the App Registration\n"
-            "  ────────────────────────────────────\n"
+            "  " + "\u2500" * 36 + "\n"
             "  1. Sign in to portal.azure.com as a Global Admin for the customer\n"
             "  2. Go to: Entra ID > App registrations > New registration\n"
             "  3. Name: 'User Provisioning Tool'\n"
             "  4. Supported account types: 'Accounts in this organizational directory only'\n"
             "  5. Click Register\n"
             "  6. On the overview page, copy:\n"
-            "     - Application (client) ID  ->  GRAPH_CLIENT_ID in the config\n"
-            "     - Directory (tenant) ID    ->  GRAPH_TENANT_ID in the config\n\n"
+            "     - Application (client) ID  ->  graph_client_id in config.json\n"
+            "     - Directory (tenant) ID    ->  graph_tenant_id in config.json\n\n"
             "  Step 2: Upload the Certificate\n"
-            "  ──────────────────────────────\n"
+            "  " + "\u2500" * 30 + "\n"
             "  1. In the App Registration, go to: Certificates & secrets\n"
             "  2. Click 'Upload certificate'\n"
             "  3. Upload the .cer public key file (from the certificate step)\n"
-            "  4. Copy the thumbprint shown -> GRAPH_CERT_THUMBPRINT in the config\n\n"
+            "  4. Copy the thumbprint shown -> graph_cert_thumbprint in config.json\n\n"
             "  Step 3: Grant API Permissions\n"
-            "  ─────────────────────────────\n"
+            "  " + "\u2500" * 29 + "\n"
             "  1. In the App Registration, go to: API permissions\n"
             "  2. Click 'Add a permission' > Microsoft Graph > Application permissions\n"
             "  3. Add these permissions:\n"
@@ -1940,26 +2663,26 @@ REMEDIATION = {
             "     - Group.ReadWrite.All\n"
             "     - GroupMember.ReadWrite.All\n"
             "  4. Click 'Grant admin consent for <tenant name>'\n"
-            "     (requires Global Admin — the green checkmarks must appear)\n\n"
-            "  Step 4: Update Config Constants\n"
-            "  ───────────────────────────────\n"
-            "  Edit the script's configuration section with the customer's values:\n"
-            f"    GRAPH_TENANT_ID = '<Directory (tenant) ID>'\n"
-            f"    GRAPH_CLIENT_ID = '<Application (client) ID>'\n"
-            f"    GRAPH_CERT_THUMBPRINT = '<certificate thumbprint>'\n"
-            f"    GRAPH_CERT_PATH = r'{GRAPH_CERT_PATH}'\n\n"
+            "     (requires Global Admin \u2014 the green checkmarks must appear)\n\n"
+            "  Step 4: Update config.json\n"
+            "  " + "\u2500" * 27 + "\n"
+            f"  Edit {CONFIG_PATH} with the customer's values:\n"
+            "    graph_tenant_id: '<Directory (tenant) ID>'\n"
+            "    graph_client_id: '<Application (client) ID>'\n"
+            "    graph_cert_thumbprint: '<certificate thumbprint>'\n\n"
+            "  Or use the 'Run Setup Wizard' button to configure interactively.\n\n"
             "  Then click 'Retry' to re-run checks.\n\n"
             "COMMON ERRORS:\n"
-            "  - AADSTS700016: App not found — wrong Client ID or Tenant ID\n"
-            "  - AADSTS700027: Certificate mismatch — wrong thumbprint or cert not uploaded\n"
-            "  - AADSTS7000215: Invalid client secret — using secret instead of cert\n"
-            "  - AADSTS50034: User account doesn't exist — wrong tenant"
+            "  - AADSTS700016: App not found \u2014 wrong Client ID or Tenant ID\n"
+            "  - AADSTS700027: Certificate mismatch \u2014 wrong thumbprint or cert not uploaded\n"
+            "  - AADSTS7000215: Invalid client secret \u2014 using secret instead of cert\n"
+            "  - AADSTS50034: User account doesn't exist \u2014 wrong tenant"
         ),
     },
     "graph_perms": {
         CHECK_FAIL: (
             "HOW TO FIX: Graph API Permissions\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 33 + "\n"
             "Authentication works, but the app is missing required permissions.\n\n"
             "1. Go to: portal.azure.com > Entra ID > App registrations\n"
             "2. Select the 'User Provisioning Tool' app\n"
@@ -1979,22 +2702,22 @@ REMEDIATION = {
         ),
         CHECK_WARN: (
             "WARNING: Partial Permissions\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 28 + "\n"
             "License management works, but cloud group management is not available.\n\n"
             "To enable cloud group assignment, add these permissions to the App Registration:\n"
             "  - Group.ReadWrite.All\n"
             "  - GroupMember.ReadWrite.All\n\n"
             "Then grant admin consent and click 'Retry'.\n\n"
-            "You can continue without this — on-prem AD groups and licensing will still work."
+            "You can continue without this \u2014 on-prem AD groups and licensing will still work."
         ),
     },
     "adsync": {
         CHECK_WARN: (
             "INFO: Entra Connect Sync Server\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 31 + "\n"
             "The tool couldn't automatically detect where Entra Connect is installed.\n"
             "This is common if the sync agent is on a member server (not a DC).\n\n"
-            "You can still use the tool — in the main window you'll see options to:\n"
+            "You can still use the tool \u2014 in the main window you'll see options to:\n"
             "  - Enter the sync server hostname manually\n"
             "  - Skip sync entirely (and trigger it yourself)\n\n"
             "To find the Entra Connect server:\n"
@@ -2004,25 +2727,29 @@ REMEDIATION = {
             "     Get-Service ADSync\n\n"
             "If the customer uses Entra Cloud Sync instead of Entra Connect:\n"
             "  - Cloud Sync doesn't have a Start-ADSyncSyncCycle command\n"
-            "  - Select 'Skip sync' in the main window — cloud sync runs automatically\n"
+            "  - Select 'Skip sync' in the main window \u2014 cloud sync runs automatically\n"
             "    and the tool will poll until the user appears in Entra ID."
         ),
     },
     "config": {
         CHECK_FAIL: (
-            "HOW TO FIX: Configuration Not Customized\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "The script still has placeholder values that need to be set for this customer.\n\n"
-            "Edit the configuration constants at the top of the script:\n\n"
-            "  1. DOMAIN SETTINGS\n"
-            "     AD_DOMAIN = 'customer.com'          # Their AD domain FQDN\n"
-            "     AD_NETBIOS = 'CUSTOMER'              # Their NetBIOS name\n"
-            "     EMAIL_DOMAINS = ['customer.com']     # Email domain(s)\n\n"
-            "  2. MICROSOFT 365 / ENTRA ID\n"
-            "     GRAPH_TENANT_ID = '<tenant-id>'      # From App Registration overview\n"
-            "     GRAPH_CLIENT_ID = '<client-id>'      # From App Registration overview\n"
-            "     GRAPH_CERT_THUMBPRINT = '<thumbprint>'# From certificate upload\n"
-            f"     GRAPH_CERT_PATH = r'{GRAPH_CERT_PATH}'  # Path to private key PEM\n\n"
+            "HOW TO FIX: Configuration Not Found\n"
+            "\u2501" * 35 + "\n"
+            f"No config.json found at:\n  {CONFIG_PATH}\n\n"
+            "This is expected on first run. Click 'Run Setup Wizard' below\n"
+            "to create your configuration interactively.\n\n"
+            "Alternatively, create config.json manually with these keys:\n\n"
+            '  {\n'
+            '    "ad_domain": "customer.com",\n'
+            '    "ad_netbios": "CUSTOMER",\n'
+            '    "email_domains": ["customer.com"],\n'
+            '    "adsync_server": null,\n'
+            '    "graph_tenant_id": "<tenant-id>",\n'
+            '    "graph_client_id": "<client-id>",\n'
+            '    "graph_cert_thumbprint": "<thumbprint>",\n'
+            '    "graph_cert_path": "C:\\\\Certs\\\\graph_app.pem.protected"\n'
+            '  }\n\n'
+            f"Save it to: {CONFIG_PATH}\n\n"
             "  HOW TO FIND THESE VALUES:\n"
             "  - portal.azure.com > Entra ID > App registrations > your app > Overview\n"
             "  - Tenant ID = 'Directory (tenant) ID'\n"
@@ -2034,21 +2761,23 @@ REMEDIATION = {
 
 
 def _preflight_check_config() -> tuple:
-    """Verify the configuration constants have been customized for this customer."""
-    issues = []
+    """Verify config.json exists, is valid JSON, and has required keys."""
+    if not os.path.isfile(CONFIG_PATH):
+        return CHECK_FAIL, f"config.json not found at {CONFIG_PATH}"
 
-    if GRAPH_TENANT_ID.startswith("xxxx") or GRAPH_TENANT_ID == "":
-        issues.append("GRAPH_TENANT_ID is not set")
-    if GRAPH_CLIENT_ID.startswith("xxxx") or GRAPH_CLIENT_ID == "":
-        issues.append("GRAPH_CLIENT_ID is not set")
-    if GRAPH_CERT_THUMBPRINT.startswith("AABB") or GRAPH_CERT_THUMBPRINT == "":
-        issues.append("GRAPH_CERT_THUMBPRINT is not set")
-    if AD_DOMAIN == "contoso.com":
-        issues.append("AD_DOMAIN is still set to 'contoso.com'")
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return CHECK_FAIL, f"config.json is not valid JSON: {e}"
+    except OSError as e:
+        return CHECK_FAIL, f"Cannot read config.json: {e}"
 
-    if issues:
-        return CHECK_FAIL, "Config not customized: " + "; ".join(issues)
-    return CHECK_PASS, f"Configuration set for {AD_DOMAIN}"
+    missing = [k for k in REQUIRED_CONFIG_KEYS if not data.get(k)]
+    if missing:
+        return CHECK_FAIL, f"config.json missing required keys: {', '.join(missing)}"
+
+    return CHECK_PASS, f"Configuration loaded for {data.get('ad_domain', '?')}"
 
 
 def _preflight_check_powershell() -> tuple:
@@ -2069,7 +2798,7 @@ def _preflight_check_ad_module() -> tuple:
     success, stdout, stderr = run_powershell(script, timeout=15)
     if success and "DOMAIN:" in stdout:
         domain = stdout.split("DOMAIN:")[1].strip()
-        return CHECK_PASS, f"AD module loaded — domain: {domain}"
+        return CHECK_PASS, f"AD module loaded \u2014 domain: {domain}"
     if "not recognized" in stderr.lower() or "not installed" in stderr.lower():
         return CHECK_FAIL, "ActiveDirectory module not installed"
     return CHECK_FAIL, f"AD module error: {stderr[:150]}"
@@ -2085,7 +2814,7 @@ def _preflight_check_ad_permissions() -> tuple:
     success, stdout, stderr = run_powershell(script, timeout=15)
     if success and "OUS:" in stdout:
         count = stdout.split("OUS:")[1].strip()
-        return CHECK_PASS, f"AD read access confirmed — {count} OUs found"
+        return CHECK_PASS, f"AD read access confirmed \u2014 {count} OUs found"
     if "access" in stderr.lower() or "denied" in stderr.lower():
         return CHECK_FAIL, "Insufficient AD permissions"
     return CHECK_WARN, f"Could not verify AD permissions: {stderr[:150]}"
@@ -2114,22 +2843,53 @@ def _preflight_check_network() -> tuple:
 
 
 def _preflight_check_certificate() -> tuple:
-    """Verify the Graph API certificate file exists and is readable."""
-    if not os.path.isfile(GRAPH_CERT_PATH):
-        return CHECK_FAIL, f"Certificate not found at {GRAPH_CERT_PATH}"
+    """Verify the Graph API certificate file exists and is readable (plain or DPAPI-encrypted)."""
+    cert_path = cfg.get("graph_cert_path", "")
+    if not cert_path:
+        return CHECK_FAIL, "graph_cert_path not set in config.json"
 
-    try:
-        with open(GRAPH_CERT_PATH, "r") as f:
-            content = f.read(100)
-        if "PRIVATE KEY" in content or "BEGIN" in content:
-            return CHECK_PASS, f"Certificate found: {GRAPH_CERT_PATH}"
-        return CHECK_WARN, "File exists but may not be a valid PEM certificate"
-    except OSError as e:
-        return CHECK_FAIL, f"Cannot read certificate: {e}"
+    # Check for DPAPI-protected file
+    protected_path = cert_path + ".protected" if not cert_path.endswith(".protected") else cert_path
+    if cert_path.endswith(".protected"):
+        plain_path = cert_path[:-len(".protected")]
+    else:
+        plain_path = cert_path
+
+    if os.path.isfile(protected_path):
+        # Try to verify it can be decrypted
+        try:
+            content = dpapi_decrypt_to_memory(protected_path)
+            if "PRIVATE KEY" in content or "BEGIN" in content:
+                return CHECK_PASS, f"DPAPI-encrypted certificate found: {protected_path}"
+            return CHECK_WARN, "Protected file exists but may not contain a valid PEM certificate"
+        except RuntimeError:
+            return CHECK_WARN, (
+                f"Protected file found at {protected_path} but DPAPI decryption failed. "
+                "This can happen if the file was encrypted by a different user account."
+            )
+
+    if os.path.isfile(plain_path):
+        try:
+            with open(plain_path, "r") as f:
+                content = f.read(100)
+            if "PRIVATE KEY" in content or "BEGIN" in content:
+                return CHECK_WARN, (
+                    f"Plain PEM found at {plain_path} (not DPAPI-encrypted). "
+                    "Consider encrypting it for security."
+                )
+            return CHECK_WARN, "File exists but may not be a valid PEM certificate"
+        except OSError as e:
+            return CHECK_FAIL, f"Cannot read certificate: {e}"
+
+    return CHECK_FAIL, f"Certificate not found at {protected_path} or {plain_path}"
 
 
 def _preflight_check_graph_auth() -> tuple:
     """Verify Microsoft Graph authentication works (acquire a token)."""
+    # Skip if config is not loaded
+    if not cfg.get("graph_tenant_id") or not cfg.get("graph_client_id"):
+        return CHECK_FAIL, "Graph tenant/client IDs not configured in config.json"
+
     try:
         token = get_graph_token()
         if token:
@@ -2138,9 +2898,9 @@ def _preflight_check_graph_auth() -> tuple:
     except RuntimeError as e:
         msg = str(e)
         if "AADSTS700016" in msg:
-            return CHECK_FAIL, "App not found — wrong Client ID or Tenant ID"
+            return CHECK_FAIL, "App not found \u2014 wrong Client ID or Tenant ID"
         if "AADSTS700027" in msg:
-            return CHECK_FAIL, "Certificate mismatch — wrong thumbprint or cert not uploaded"
+            return CHECK_FAIL, "Certificate mismatch \u2014 wrong thumbprint or cert not uploaded"
         if "AADSTS" in msg:
             return CHECK_FAIL, f"Entra ID error: {msg[:150]}"
         return CHECK_FAIL, f"Graph auth failed: {msg[:150]}"
@@ -2179,94 +2939,7 @@ def _preflight_check_adsync() -> tuple:
     server, method = detect_sync_server()
     if server:
         return CHECK_PASS, f"Entra Connect found: {server} (detected via {method})"
-    return CHECK_WARN, "Not detected — enter manually in the main window or skip sync"
-
-
-def generate_certificate_on_dc() -> tuple:
-    """
-    Generate a self-signed certificate on the DC for Graph API authentication.
-    Exports private key as PEM and public key as CER.
-
-    Returns:
-        (success: bool, thumbprint: str, message: str)
-    """
-    cert_dir = os.path.dirname(GRAPH_CERT_PATH)
-    cer_path = GRAPH_CERT_PATH.replace(".pem", ".cer")
-
-    script = f"""
-    # Create certificate directory
-    New-Item -ItemType Directory -Force -Path '{cert_dir}' | Out-Null
-
-    # Generate self-signed certificate (2-year expiry)
-    $cert = New-SelfSignedCertificate `
-      -Subject 'CN=UserProvisioningTool' `
-      -FriendlyName 'User Provisioning Tool - Graph API' `
-      -CertStoreLocation 'Cert:\\CurrentUser\\My' `
-      -KeyExportPolicy Exportable `
-      -KeySpec Signature `
-      -KeyLength 2048 `
-      -KeyAlgorithm RSA `
-      -HashAlgorithm SHA256 `
-      -NotAfter (Get-Date).AddYears(2)
-
-    # Export public key as CER (for uploading to Azure)
-    Export-Certificate -Cert $cert -FilePath '{cer_path}' -Force | Out-Null
-
-    # Export private key as PEM using .NET
-    # Get the RSA private key
-    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-    $privKeyBytes = $rsa.ExportRSAPrivateKey()
-    $privKeyPem = "-----BEGIN RSA PRIVATE KEY-----`r`n"
-    $privKeyPem += [Convert]::ToBase64String($privKeyBytes, 'InsertLineBreaks')
-    $privKeyPem += "`r`n-----END RSA PRIVATE KEY-----"
-
-    # Also include the certificate (public key) in the PEM for MSAL
-    $certBytes = $cert.Export('Cert')
-    $certPem = "-----BEGIN CERTIFICATE-----`r`n"
-    $certPem += [Convert]::ToBase64String($certBytes, 'InsertLineBreaks')
-    $certPem += "`r`n-----END CERTIFICATE-----"
-
-    $fullPem = $privKeyPem + "`r`n" + $certPem
-    Set-Content -Path '{GRAPH_CERT_PATH}' -Value $fullPem -Encoding ASCII
-
-    # Output thumbprint and paths for the caller
-    $result = @{{
-      thumbprint = $cert.Thumbprint
-      pem_path = '{GRAPH_CERT_PATH}'
-      cer_path = '{cer_path}'
-      expiry = $cert.NotAfter.ToString('yyyy-MM-dd')
-      subject = $cert.Subject
-    }}
-    $result | ConvertTo-Json -Compress
-    """
-
-    logger.info("Generating self-signed certificate for Graph API...")
-    success, stdout, stderr = run_powershell(script, timeout=30)
-
-    if not success:
-        logger.error("Certificate generation failed: %s", stderr)
-        return False, "", f"Failed to generate certificate: {stderr[:300]}"
-
-    try:
-        data = json.loads(stdout)
-        thumbprint = data.get("thumbprint", "")
-        logger.info("Certificate generated — thumbprint: %s", thumbprint)
-        return True, thumbprint, (
-            f"Certificate generated successfully!\n\n"
-            f"  Thumbprint:  {thumbprint}\n"
-            f"  Private key: {data.get('pem_path', GRAPH_CERT_PATH)}\n"
-            f"  Public key:  {data.get('cer_path', cer_path)}\n"
-            f"  Expires:     {data.get('expiry', 'unknown')}\n\n"
-            f"NEXT STEPS:\n"
-            f"  1. Upload {cer_path} to your App Registration:\n"
-            f"     portal.azure.com > Entra ID > App registrations >\n"
-            f"     your app > Certificates & secrets > Upload certificate\n\n"
-            f"  2. Update the config in the script:\n"
-            f"     GRAPH_CERT_THUMBPRINT = '{thumbprint}'\n\n"
-            f"  3. Click 'Retry' to re-run preflight checks."
-        )
-    except json.JSONDecodeError:
-        return False, "", f"Certificate may have been created but could not parse output: {stdout[:200]}"
+    return CHECK_WARN, "Not detected \u2014 enter manually in the main window or skip sync"
 
 
 # Ordered list of preflight checks: (name, display_label, check_function, is_required)
@@ -2309,7 +2982,7 @@ class PreflightDialog(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Preflight Check — 365 User Provisioning")
+        self.title("Preflight Check \u2014 365 User Provisioning")
         self.geometry("820x700")
         self.resizable(True, True)
 
@@ -2372,7 +3045,7 @@ class PreflightDialog(tk.Tk):
         self.summary_label = ttk.Label(self, text="", font=("Segoe UI", 10, "bold"))
         self.summary_label.pack(pady=(0, 5))
 
-        # ── Detail pane (remediation instructions) ───────────────────────
+        # -- Detail pane (remediation instructions) ------------------------
         detail_frame = ttk.LabelFrame(self, text=" Setup Instructions ", padding=8)
         detail_frame.pack(fill="both", expand=True, padx=15, pady=(0, 5))
 
@@ -2393,12 +3066,18 @@ class PreflightDialog(tk.Tk):
         # Hidden by default — shown only when certificate check fails
         self.gen_cert_btn.pack_forget()
 
+        self.setup_wizard_btn = ttk.Button(
+            self.detail_btn_frame, text="Run Setup Wizard",
+            command=self._on_setup_wizard)
+        # Hidden by default — shown when config check fails
+        self.setup_wizard_btn.pack_forget()
+
         self.copy_btn = ttk.Button(
             self.detail_btn_frame, text="Copy to Clipboard",
             command=self._copy_detail_to_clipboard)
         self.copy_btn.pack(side="right")
 
-        # ── Main buttons ─────────────────────────────────────────────────
+        # -- Main buttons --------------------------------------------------
         btn_frame = ttk.Frame(self, padding=(15, 5))
         btn_frame.pack(fill="x")
 
@@ -2415,22 +3094,22 @@ class PreflightDialog(tk.Tk):
         # Show welcome message in detail pane
         self._set_detail_text(
             "CUSTOMER SETUP CHECKLIST\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\u2501" * 24 + "\n"
             "For each new customer deployment, you need:\n\n"
-            "  1. Edit the script's configuration constants:\n"
-            "     - AD_DOMAIN, AD_NETBIOS, EMAIL_DOMAINS\n"
-            "     - GRAPH_TENANT_ID, GRAPH_CLIENT_ID\n"
-            "     - GRAPH_CERT_THUMBPRINT, GRAPH_CERT_PATH\n\n"
+            f"  1. Create config.json next to the EXE:\n"
+            f"     {CONFIG_PATH}\n"
+            "     (Use the 'Run Setup Wizard' button for guided setup)\n\n"
             "  2. Create an App Registration in the customer's Entra ID tenant\n"
             "     (portal.azure.com > Entra ID > App registrations)\n\n"
             "  3. Generate a certificate and upload the public key to the App Registration\n"
             "     (use the 'Generate Certificate' button when that check fails)\n\n"
             "  4. Grant API permissions and admin consent on the App Registration\n\n"
-            "  5. Place the EXE + PEM certificate on the customer's DC\n\n"
+            "  5. Place the EXE + config.json + .pem.protected on the customer's DC\n\n"
             "Checks are running now. Click any failed check for detailed instructions."
         )
 
-    def _set_detail_text(self, text: str, show_cert_btn: bool = False):
+    def _set_detail_text(self, text: str, show_cert_btn: bool = False,
+                          show_wizard_btn: bool = False):
         """Update the detail/remediation text pane."""
         self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
@@ -2442,6 +3121,11 @@ class PreflightDialog(tk.Tk):
             self.gen_cert_btn.pack(side="left", padx=(0, 10))
         else:
             self.gen_cert_btn.pack_forget()
+
+        if show_wizard_btn:
+            self.setup_wizard_btn.pack(side="left", padx=(0, 10))
+        else:
+            self.setup_wizard_btn.pack_forget()
 
     def _show_remediation(self, check_name: str):
         """Show detailed remediation instructions for a specific check."""
@@ -2455,15 +3139,19 @@ class PreflightDialog(tk.Tk):
         check_remediation = REMEDIATION.get(check_name, {})
         instructions = check_remediation.get(status)
 
+        show_cert = (check_name == "certificate" and status in (CHECK_FAIL, CHECK_WARN))
+        show_wizard = (check_name == "config" and status == CHECK_FAIL)
+
         if instructions:
-            show_cert = (check_name == "certificate" and status == CHECK_FAIL)
-            self._set_detail_text(instructions, show_cert_btn=show_cert)
+            self._set_detail_text(instructions, show_cert_btn=show_cert,
+                                   show_wizard_btn=show_wizard)
         else:
             self._set_detail_text(
                 f"Status: {status.upper()}\n"
                 f"Detail: {message}\n\n"
                 "No specific remediation steps available for this issue.\n"
-                "Check the log file for more details."
+                "Check the log file for more details.",
+                show_wizard_btn=show_wizard
             )
 
     def _update_check(self, name: str, status: str, detail: str = ""):
@@ -2494,7 +3182,7 @@ class PreflightDialog(tk.Tk):
                     message = f"Unexpected error: {e}"
                     logger.exception("Preflight check '%s' crashed", name)
 
-                logger.info("Preflight [%s]: %s — %s", name, status, message)
+                logger.info("Preflight [%s]: %s \u2014 %s", name, status, message)
                 self.after(0, self._update_check, name, status, message)
                 self.after(0, self._advance_progress, i + 1)
 
@@ -2504,7 +3192,7 @@ class PreflightDialog(tk.Tk):
                     for j in range(i + 1, len(PREFLIGHT_CHECKS)):
                         remaining_name = PREFLIGHT_CHECKS[j][0]
                         self.after(0, self._update_check, remaining_name,
-                                   CHECK_PENDING, "Skipped — fix above issue first")
+                                   CHECK_PENDING, "Skipped \u2014 fix above issue first")
                     self.after(0, self._advance_progress, len(PREFLIGHT_CHECKS))
                     break
 
@@ -2536,7 +3224,7 @@ class PreflightDialog(tk.Tk):
             self._checks_passed = False
             self.continue_btn.configure(state="disabled")
             self.summary_label.configure(
-                text=f"BLOCKED: {len(required_failed)} required check(s) failed — see instructions below",
+                text=f"BLOCKED: {len(required_failed)} required check(s) failed \u2014 see instructions below",
                 foreground="red")
             # Auto-show remediation for the first failure
             if first_fail_name:
@@ -2545,13 +3233,13 @@ class PreflightDialog(tk.Tk):
             self._checks_passed = True
             self.continue_btn.configure(state="normal")
             self.summary_label.configure(
-                text=f"READY with {len(warnings)} warning(s) — some features may be limited",
+                text=f"READY with {len(warnings)} warning(s) \u2014 some features may be limited",
                 foreground="orange")
         else:
             self._checks_passed = True
             self.continue_btn.configure(state="normal")
             self.summary_label.configure(
-                text="ALL CHECKS PASSED — ready to launch",
+                text="ALL CHECKS PASSED \u2014 ready to launch",
                 foreground="green")
 
     def _on_generate_cert(self):
@@ -2586,6 +3274,16 @@ class PreflightDialog(tk.Tk):
 
         threading.Thread(target=wrapper, daemon=True).start()
 
+    def _on_setup_wizard(self):
+        """Launch the setup wizard dialog."""
+        wizard = SetupWizard(self)
+        self.wait_window(wizard)
+        if wizard.completed:
+            # Reload config and re-run checks
+            self._set_detail_text(
+                "Configuration saved. Re-running all checks...")
+            self._on_retry()
+
     def _copy_detail_to_clipboard(self):
         """Copy the current detail text to clipboard."""
         self.clipboard_clear()
@@ -2600,6 +3298,8 @@ class PreflightDialog(tk.Tk):
 
     def _on_retry(self):
         """Re-run all checks."""
+        global cfg
+        cfg = load_config()
         _graph_token_cache["token"] = None
         _graph_token_cache["expires_at"] = 0
         _detected_sync_server["checked"] = False
@@ -2624,6 +3324,7 @@ def main():
     logger.info("=" * 60)
     logger.info("User Provisioning Tool started at %s",
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+    logger.info("Config path: %s (exists: %s)", CONFIG_PATH, os.path.isfile(CONFIG_PATH))
     logger.info("=" * 60)
 
     # Run preflight checks
@@ -2631,10 +3332,10 @@ def main():
     preflight.mainloop()
 
     if not preflight.passed:
-        logger.info("Preflight checks failed or user quit — exiting")
+        logger.info("Preflight checks failed or user quit \u2014 exiting")
         return
 
-    logger.info("Preflight passed — launching main application")
+    logger.info("Preflight passed \u2014 launching main application")
 
     # Launch main application
     app = ProvisioningApp()
