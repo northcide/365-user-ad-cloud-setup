@@ -477,7 +477,7 @@ def get_user_ad_groups(sam_account_name: str) -> list:
 
     ps1_content = (
         "Import-Module ActiveDirectory\n"
-        "$dc = (Get-ADDomainController -Discover).HostName[0]\n"
+        "$dc = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName\n"
         "$m = (Get-ADUser -Identity '" + safe_sam + "' -Server $dc -Properties MemberOf).MemberOf\n"
         "if ($m -and $m.Count -gt 0) {\n"
         "    $m | ConvertTo-Json -Compress | Out-File -FilePath '" + out_path + "' -Encoding ASCII -Force\n"
