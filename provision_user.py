@@ -466,41 +466,48 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     """
     safe_sam = sanitize_for_powershell(sam_account_name)
     logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
+
+    # Use Get-ADPrincipalGroupMembership which is more reliable than
+    # the MemberOf property (includes all groups, primary group, etc.)
     script = f"""
     Import-Module ActiveDirectory
-    $ErrorActionPreference = 'Stop'
-    try {{
-        $user = Get-ADUser -Identity '{safe_sam}' -Properties MemberOf
-        $count = 0
-        if ($user.MemberOf) {{ $count = $user.MemberOf.Count }}
-        Write-Host "MEMBEROF_COUNT:$count"
-        if ($count -gt 0) {{
-            $user.MemberOf | ConvertTo-Json -Compress
-        }} else {{
-            Write-Output '[]'
-        }}
-    }} catch {{
-        Write-Host "ERROR:$($_.Exception.Message)"
+    $groups = Get-ADPrincipalGroupMembership -Identity '{safe_sam}' |
+      Select-Object -Property DistinguishedName
+    $dns = @($groups | ForEach-Object {{ $_.DistinguishedName }})
+    if ($dns.Count -gt 0) {{
+        $dns | ConvertTo-Json -Compress
+    }} else {{
         Write-Output '[]'
     }}
     """
-    success, stdout, stderr = run_powershell(script, timeout=15)
-    logger.info("AD groups raw stdout (%d chars): %s", len(stdout), stdout[:500])
-    if stderr:
-        logger.info("AD groups stderr: %s", stderr[:300])
+    success, stdout, stderr = run_powershell(script, timeout=30)
+
+    # Strip any CLIXML progress noise from stdout (Write-Host, progress bars)
+    # The JSON should be the last line
+    lines = stdout.strip().split("\n")
+    json_line = ""
+    for line in reversed(lines):
+        line = line.strip()
+        if line.startswith("[") or line.startswith('"'):
+            json_line = line
+            break
+    if not json_line:
+        json_line = stdout.strip()
+
+    logger.info("AD groups lookup result: success=%s, output=%s", success, json_line[:300])
 
     if not success:
-        logger.warning("Failed to get user AD groups (exit code): %s", stderr[:300])
+        logger.warning("Failed to get user AD groups: %s", stderr[:300])
         return []
 
     try:
-        data = json.loads(stdout) if stdout else []
+        data = json.loads(json_line) if json_line else []
         if isinstance(data, str):
             data = [data]
         logger.info("User AD groups found: %d", len(data))
         return data
     except json.JSONDecodeError:
-        logger.warning("Could not parse user AD groups: %s", stdout[:300])
+        logger.warning("Could not parse user AD groups: %s", json_line[:300])
         return []
 
 
