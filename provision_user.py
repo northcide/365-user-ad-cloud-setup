@@ -466,21 +466,27 @@ def get_user_ad_groups(user_dn: str) -> list:
     safe_dn = sanitize_for_powershell(user_dn)
     script = f"""
     Import-Module ActiveDirectory
-    Get-ADUser -Identity '{safe_dn}' -Properties MemberOf |
-      Select-Object -ExpandProperty MemberOf |
-      ConvertTo-Json -Compress
+    $user = Get-ADUser -Identity '{safe_dn}' -Properties MemberOf
+    $groups = @($user.MemberOf)
+    if ($groups.Count -gt 0) {{
+        $groups | ConvertTo-Json -Compress
+    }} else {{
+        Write-Output '[]'
+    }}
     """
     success, stdout, stderr = run_powershell(script, timeout=15)
     if not success:
-        logger.warning("Failed to get user groups: %s", stderr)
+        logger.warning("Failed to get user AD groups: %s", stderr)
         return []
 
     try:
         data = json.loads(stdout) if stdout else []
         if isinstance(data, str):
             data = [data]
+        logger.info("User AD groups found: %d", len(data))
         return data
     except json.JSONDecodeError:
+        logger.warning("Could not parse user AD groups: %s", stdout[:200])
         return []
 
 
@@ -2141,13 +2147,13 @@ class ProvisioningApp(tk.Tk):
             display_values.append(canonical)
         self.ou_combo["values"] = display_values
         if display_values:
-            # Try to default to a "Users" OU, otherwise the domain root
+            # Default to the domain root (shortest canonical path = shallowest OU)
             default_idx = 0
+            shortest_len = len(display_values[0])
             for i, val in enumerate(display_values):
-                lower = val.lower()
-                if lower.endswith("/users") or "/users" in lower:
+                if len(val) < shortest_len:
+                    shortest_len = len(val)
                     default_idx = i
-                    break
             self.ou_combo.current(default_idx)
 
     def _load_upn_suffixes(self):
@@ -2384,6 +2390,8 @@ class ProvisioningApp(tk.Tk):
     def _select_ad_groups_by_dn(self, group_dns: list) -> int:
         """Auto-select AD groups across all tabs by DN. Returns count selected."""
         dn_set = set(d.lower() for d in group_dns)
+        logger.info("Matching %d user group DNs against %d security + %d distribution groups",
+                     len(dn_set), len(self._ad_security_map), len(self._ad_distribution_map))
         count = 0
         for idx, dn in self._ad_security_map.items():
             if dn.lower() in dn_set:
@@ -2393,6 +2401,12 @@ class ProvisioningApp(tk.Tk):
             if dn.lower() in dn_set:
                 self.ad_distribution_listbox.selection_set(idx)
                 count += 1
+        if count == 0 and dn_set:
+            # Log a sample for debugging
+            sample_user_dn = next(iter(dn_set))
+            sample_map_dn = next(iter(self._ad_security_map.values()), "(empty)")
+            logger.warning("No AD group matches. Sample user group: %s | Sample map entry: %s",
+                           sample_user_dn, sample_map_dn)
         return count
 
     def _select_cloud_groups_by_id(self, group_ids: list) -> int:
