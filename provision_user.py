@@ -495,7 +495,7 @@ def search_ad_users(search_term: str) -> list:
 
     script = f"""
     Import-Module ActiveDirectory
-    Get-ADUser -Filter "Name -like '*{safe_term}*'" -Properties DisplayName, Title |
+    Get-ADUser -Filter "Name -like '*{safe_term}*' -or DisplayName -like '*{safe_term}*' -or SamAccountName -like '*{safe_term}*'" -Properties DisplayName, Title |
       Select-Object -First 20
         @{{N='display_name';E={{$_.DisplayName}}}},
         @{{N='dn';E={{$_.DistinguishedName}}}},
@@ -2297,11 +2297,11 @@ class ProvisioningApp(tk.Tk):
             return
 
         def search():
-            # Reuse the existing search but also grab UPN
             safe_term = sanitize_for_powershell(term)
+            # Search across Name, DisplayName, SamAccountName, and UPN
             script = f"""
             Import-Module ActiveDirectory
-            Get-ADUser -Filter "Name -like '*{safe_term}*'" -Properties DisplayName, Title, UserPrincipalName |
+            Get-ADUser -Filter "Name -like '*{safe_term}*' -or DisplayName -like '*{safe_term}*' -or SamAccountName -like '*{safe_term}*' -or UserPrincipalName -like '*{safe_term}*'" -Properties DisplayName, Title, UserPrincipalName |
               Select-Object -First 20
                 @{{N='display_name';E={{$_.DisplayName}}}},
                 @{{N='dn';E={{$_.DistinguishedName}}}},
