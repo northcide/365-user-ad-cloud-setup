@@ -427,23 +427,25 @@ def get_ad_ous() -> list:
         return []
 
 
-def get_ad_security_groups() -> list:
+def get_ad_groups() -> list:
     """
-    Retrieve on-prem AD security groups.
-    Returns a list of dicts with 'name', 'dn', and 'description' keys.
+    Retrieve all on-prem AD groups (Security and Distribution).
+    Returns a list of dicts with 'name', 'dn', 'description', and 'category' keys.
+    Category is 'Security' or 'Distribution'.
     """
     script = """
     Import-Module ActiveDirectory
-    Get-ADGroup -Filter {GroupCategory -eq 'Security'} -Properties Description |
+    Get-ADGroup -Filter * -Properties Description, GroupCategory |
       Select-Object @{N='name';E={$_.Name}},
                     @{N='dn';E={$_.DistinguishedName}},
-                    @{N='description';E={$_.Description}} |
+                    @{N='description';E={$_.Description}},
+                    @{N='category';E={$_.GroupCategory.ToString()}} |
       Sort-Object name |
       ConvertTo-Json -Compress
     """
-    success, stdout, stderr = run_powershell(script, timeout=30)
+    success, stdout, stderr = run_powershell(script, timeout=45)
     if not success:
-        logger.error("Failed to get security groups: %s", stderr)
+        logger.error("Failed to get AD groups: %s", stderr)
         return []
 
     try:
@@ -453,6 +455,32 @@ def get_ad_security_groups() -> list:
         return data
     except json.JSONDecodeError:
         logger.error("Failed to parse group data: %s", stdout[:200])
+        return []
+
+
+def get_user_ad_groups(user_dn: str) -> list:
+    """
+    Get the list of group DNs that a user is a member of.
+    Returns a list of group DN strings.
+    """
+    safe_dn = sanitize_for_powershell(user_dn)
+    script = f"""
+    Import-Module ActiveDirectory
+    Get-ADUser -Identity '{safe_dn}' -Properties MemberOf |
+      Select-Object -ExpandProperty MemberOf |
+      ConvertTo-Json -Compress
+    """
+    success, stdout, stderr = run_powershell(script, timeout=15)
+    if not success:
+        logger.warning("Failed to get user groups: %s", stderr)
+        return []
+
+    try:
+        data = json.loads(stdout) if stdout else []
+        if isinstance(data, str):
+            data = [data]
+        return data
+    except json.JSONDecodeError:
         return []
 
 
@@ -898,6 +926,35 @@ def get_cloud_groups() -> list:
 
     groups.sort(key=lambda x: x["display_name"].lower())
     return groups
+
+
+def get_user_cloud_groups(user_upn: str) -> list:
+    """
+    Get the cloud group IDs that a user is a member of.
+    Returns a list of group ID strings (cloud-only groups only).
+    """
+    try:
+        resp = requests.get(
+            f"https://graph.microsoft.com/v1.0/users/{user_upn}/memberOf"
+            "?$select=id,displayName,groupTypes,securityEnabled,onPremisesSyncEnabled"
+            "&$top=999",
+            headers=_graph_headers(),
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.warning("Failed to get user cloud groups: %d", resp.status_code)
+            return []
+    except requests.RequestException as e:
+        logger.warning("Failed to get user cloud groups: %s", e)
+        return []
+
+    group_ids = []
+    for item in resp.json().get("value", []):
+        # Only include cloud-only groups (skip on-prem synced)
+        if item.get("@odata.type") == "#microsoft.graph.group":
+            if item.get("onPremisesSyncEnabled") is not True:
+                group_ids.append(item["id"])
+    return group_ids
 
 
 def add_user_to_cloud_groups(user_id: str, group_ids: list) -> list:
@@ -1904,6 +1961,27 @@ class ProvisioningApp(tk.Tk):
 
         # ===================== RIGHT COLUMN ===============================
 
+        # -- Copy Groups From Existing User --------------------------------
+        frame_copy = ttk.LabelFrame(right, text=" Copy Groups From User ", padding=8)
+        frame_copy.pack(fill="x", **p)
+
+        self.copy_user_search_var = tk.StringVar()
+        copy_row = ttk.Frame(frame_copy)
+        copy_row.pack(fill="x")
+        ttk.Entry(copy_row, textvariable=self.copy_user_search_var, width=22).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(copy_row, text="Lookup", width=7,
+                    command=self._copy_from_user_search).pack(side="left", padx=(3, 0))
+
+        self.copy_user_results = tk.Listbox(frame_copy, height=3, exportselection=False)
+        self.copy_user_results.pack(fill="x")
+        self.copy_user_results.pack_forget()  # hidden by default
+        self.copy_user_results.bind("<<ListboxSelect>>", self._on_copy_user_select)
+        self._copy_user_matches = []  # list of (display, dn, upn)
+
+        self.copy_status_label = ttk.Label(frame_copy, text="", foreground="gray")
+        self.copy_status_label.pack(anchor="w")
+
         # -- Active Directory (OU + Groups + Manager) ----------------------
         frame_ad = ttk.LabelFrame(right, text=" Active Directory ", padding=8)
         frame_ad.pack(fill="both", expand=True, **p)
@@ -1914,28 +1992,52 @@ class ProvisioningApp(tk.Tk):
         self.ou_combo.grid(row=0, column=1, columnspan=2, sticky="ew")
         self._ou_map = {}
 
-        # AD Security Groups
-        ttk.Label(frame_ad, text="AD Groups").grid(row=1, column=0, sticky="nw", pady=(5, 0))
-        ad_grp_frame = ttk.Frame(frame_ad)
-        ad_grp_frame.grid(row=1, column=1, columnspan=2, sticky="nsew", pady=(5, 0))
+        # AD Groups filter
+        ttk.Label(frame_ad, text="Filter:").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        self.ad_group_filter_var = tk.StringVar()
+        ttk.Entry(frame_ad, textvariable=self.ad_group_filter_var, width=20).grid(
+            row=1, column=1, columnspan=2, sticky="ew", pady=(3, 0))
+        self.ad_group_filter_var.trace_add("write", self._on_ad_group_filter)
 
-        self.ad_groups_listbox = tk.Listbox(ad_grp_frame, selectmode="multiple",
-                                             height=5, exportselection=False)
-        groups_scroll = ttk.Scrollbar(ad_grp_frame, orient="vertical",
-                                       command=self.ad_groups_listbox.yview)
-        self.ad_groups_listbox.configure(yscrollcommand=groups_scroll.set)
-        self.ad_groups_listbox.pack(side="left", fill="both", expand=True)
-        groups_scroll.pack(side="left", fill="y")
-        self._ad_group_map = {}
+        # AD Groups tabbed by type
+        self.ad_notebook = ttk.Notebook(frame_ad)
+        self.ad_notebook.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(3, 0))
+
+        # Security tab
+        ad_sec_frame = ttk.Frame(self.ad_notebook)
+        self.ad_notebook.add(ad_sec_frame, text="Security")
+        self.ad_security_listbox = tk.Listbox(ad_sec_frame, selectmode="multiple",
+                                               height=4, exportselection=False)
+        ad_sec_scroll = ttk.Scrollbar(ad_sec_frame, orient="vertical",
+                                       command=self.ad_security_listbox.yview)
+        self.ad_security_listbox.configure(yscrollcommand=ad_sec_scroll.set)
+        self.ad_security_listbox.pack(side="left", fill="both", expand=True)
+        ad_sec_scroll.pack(side="left", fill="y")
+
+        # Distribution tab
+        ad_dist_frame = ttk.Frame(self.ad_notebook)
+        self.ad_notebook.add(ad_dist_frame, text="Distribution")
+        self.ad_distribution_listbox = tk.Listbox(ad_dist_frame, selectmode="multiple",
+                                                    height=4, exportselection=False)
+        ad_dist_scroll = ttk.Scrollbar(ad_dist_frame, orient="vertical",
+                                        command=self.ad_distribution_listbox.yview)
+        self.ad_distribution_listbox.configure(yscrollcommand=ad_dist_scroll.set)
+        self.ad_distribution_listbox.pack(side="left", fill="both", expand=True)
+        ad_dist_scroll.pack(side="left", fill="y")
+
+        # Group data maps (index -> dn, per tab, per filter state)
+        self._ad_security_map = {}
+        self._ad_distribution_map = {}
+        self._ad_groups_all = []  # full unfiltered list from AD
 
         # Manager search
         self.manager_search_var = tk.StringVar()
         self.manager_dn_var = tk.StringVar()
         self.manager_display_var = tk.StringVar()
 
-        ttk.Label(frame_ad, text="Manager").grid(row=2, column=0, sticky="w", pady=(5, 0))
+        ttk.Label(frame_ad, text="Manager").grid(row=3, column=0, sticky="w", pady=(3, 0))
         mgr_frame = ttk.Frame(frame_ad)
-        mgr_frame.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(5, 0))
+        mgr_frame.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(3, 0))
         ttk.Entry(mgr_frame, textvariable=self.manager_search_var, width=22).pack(
             side="left", fill="x", expand=True)
         ttk.Button(mgr_frame, text="Search", width=7,
@@ -1943,32 +2045,72 @@ class ProvisioningApp(tk.Tk):
 
         self.manager_selected_label = ttk.Label(frame_ad, textvariable=self.manager_display_var,
                                                   foreground="green")
-        self.manager_selected_label.grid(row=3, column=1, columnspan=2, sticky="w")
+        self.manager_selected_label.grid(row=4, column=1, columnspan=2, sticky="w")
 
         self.manager_results_listbox = tk.Listbox(frame_ad, height=3, exportselection=False)
-        self.manager_results_listbox.grid(row=4, column=1, columnspan=2, sticky="ew")
+        self.manager_results_listbox.grid(row=5, column=1, columnspan=2, sticky="ew")
         self.manager_results_listbox.grid_remove()
         self.manager_results_listbox.bind("<<ListboxSelect>>", self._on_manager_select)
         self._manager_results = []
 
         frame_ad.columnconfigure(1, weight=1)
-        frame_ad.rowconfigure(1, weight=1)
+        frame_ad.rowconfigure(2, weight=1)
 
         # -- Cloud Groups (Entra ID) --------------------------------------
         frame_cloud = ttk.LabelFrame(right, text=" Cloud Groups (Entra ID) ", padding=8)
         frame_cloud.pack(fill="both", expand=True, **p)
 
-        cloud_grp_frame = ttk.Frame(frame_cloud)
-        cloud_grp_frame.pack(fill="both", expand=True)
+        # Cloud filter
+        filter_row = ttk.Frame(frame_cloud)
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text="Filter:").pack(side="left")
+        self.cloud_group_filter_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.cloud_group_filter_var, width=20).pack(
+            side="left", fill="x", expand=True, padx=(3, 0))
+        self.cloud_group_filter_var.trace_add("write", self._on_cloud_group_filter)
 
-        self.cloud_groups_listbox = tk.Listbox(cloud_grp_frame, selectmode="multiple",
-                                                height=5, exportselection=False)
-        cloud_scroll = ttk.Scrollbar(cloud_grp_frame, orient="vertical",
-                                      command=self.cloud_groups_listbox.yview)
-        self.cloud_groups_listbox.configure(yscrollcommand=cloud_scroll.set)
-        self.cloud_groups_listbox.pack(side="left", fill="both", expand=True)
-        cloud_scroll.pack(side="left", fill="y")
-        self._cloud_group_map = {}
+        # Cloud tabbed by type
+        self.cloud_notebook = ttk.Notebook(frame_cloud)
+        self.cloud_notebook.pack(fill="both", expand=True, pady=(3, 0))
+
+        # Security tab
+        cl_sec_frame = ttk.Frame(self.cloud_notebook)
+        self.cloud_notebook.add(cl_sec_frame, text="Security")
+        self.cloud_security_listbox = tk.Listbox(cl_sec_frame, selectmode="multiple",
+                                                   height=4, exportselection=False)
+        cl_sec_scroll = ttk.Scrollbar(cl_sec_frame, orient="vertical",
+                                       command=self.cloud_security_listbox.yview)
+        self.cloud_security_listbox.configure(yscrollcommand=cl_sec_scroll.set)
+        self.cloud_security_listbox.pack(side="left", fill="both", expand=True)
+        cl_sec_scroll.pack(side="left", fill="y")
+
+        # M365 tab
+        cl_m365_frame = ttk.Frame(self.cloud_notebook)
+        self.cloud_notebook.add(cl_m365_frame, text="M365")
+        self.cloud_m365_listbox = tk.Listbox(cl_m365_frame, selectmode="multiple",
+                                               height=4, exportselection=False)
+        cl_m365_scroll = ttk.Scrollbar(cl_m365_frame, orient="vertical",
+                                        command=self.cloud_m365_listbox.yview)
+        self.cloud_m365_listbox.configure(yscrollcommand=cl_m365_scroll.set)
+        self.cloud_m365_listbox.pack(side="left", fill="both", expand=True)
+        cl_m365_scroll.pack(side="left", fill="y")
+
+        # Distribution tab
+        cl_dist_frame = ttk.Frame(self.cloud_notebook)
+        self.cloud_notebook.add(cl_dist_frame, text="Distribution")
+        self.cloud_distribution_listbox = tk.Listbox(cl_dist_frame, selectmode="multiple",
+                                                       height=4, exportselection=False)
+        cl_dist_scroll = ttk.Scrollbar(cl_dist_frame, orient="vertical",
+                                        command=self.cloud_distribution_listbox.yview)
+        self.cloud_distribution_listbox.configure(yscrollcommand=cl_dist_scroll.set)
+        self.cloud_distribution_listbox.pack(side="left", fill="both", expand=True)
+        cl_dist_scroll.pack(side="left", fill="y")
+
+        # Cloud group data maps
+        self._cloud_security_map = {}
+        self._cloud_m365_map = {}
+        self._cloud_distribution_map = {}
+        self._cloud_groups_all = []  # full unfiltered list
 
         self.cloud_groups_status = ttk.Label(frame_cloud, text="Loading...", foreground="gray")
         self.cloud_groups_status.pack(anchor="w")
@@ -2018,19 +2160,41 @@ class ProvisioningApp(tk.Tk):
                 self.email_domain_var.set(all_domains[0])
 
     def _load_ad_groups(self):
-        return get_ad_security_groups()
+        return get_ad_groups()
 
     def _populate_ad_groups(self, groups):
-        self._ad_groups = groups
-        self.ad_groups_listbox.delete(0, "end")
-        self._ad_group_map = {}
-        for i, g in enumerate(groups):
-            display = g.get("name", "")
-            desc = g.get("description", "")
-            if desc:
-                display = f"{display} \u2014 {desc[:40]}"
-            self.ad_groups_listbox.insert("end", display)
-            self._ad_group_map[i] = g.get("dn", "")
+        self._ad_groups_all = groups
+        self._render_ad_groups()
+
+    def _render_ad_groups(self, filter_text=""):
+        """Render AD groups into tabbed listboxes, filtered by search text."""
+        ft = filter_text.lower()
+
+        self.ad_security_listbox.delete(0, "end")
+        self.ad_distribution_listbox.delete(0, "end")
+        self._ad_security_map = {}
+        self._ad_distribution_map = {}
+
+        sec_idx = 0
+        dist_idx = 0
+        for g in self._ad_groups_all:
+            name = g.get("name", "")
+            desc = g.get("description", "") or ""
+            display = f"{name} -- {desc[:40]}" if desc else name
+
+            # Apply filter
+            if ft and ft not in name.lower() and ft not in desc.lower():
+                continue
+
+            category = g.get("category", "Security")
+            if category == "Distribution":
+                self.ad_distribution_listbox.insert("end", display)
+                self._ad_distribution_map[dist_idx] = g.get("dn", "")
+                dist_idx += 1
+            else:
+                self.ad_security_listbox.insert("end", display)
+                self._ad_security_map[sec_idx] = g.get("dn", "")
+                sec_idx += 1
 
     def _load_cloud_groups(self):
         try:
@@ -2040,23 +2204,52 @@ class ProvisioningApp(tk.Tk):
             return []
 
     def _populate_cloud_groups(self, groups):
-        self._cloud_groups = groups
-        self.cloud_groups_listbox.delete(0, "end")
-        self._cloud_group_map = {}
-
+        self._cloud_groups_all = groups
         if not groups:
             self.cloud_groups_status.configure(
                 text="No cloud-only groups found (all groups may be synced from AD)",
                 foreground="gray")
+            self._render_cloud_groups()
             return
 
-        for i, g in enumerate(groups):
-            display = f"[{g['group_type']}] {g['display_name']}"
-            self.cloud_groups_listbox.insert("end", display)
-            self._cloud_group_map[i] = (g["id"], g["display_name"])
-
+        self._render_cloud_groups()
         self.cloud_groups_status.configure(
             text=f"{len(groups)} cloud groups loaded", foreground="green")
+
+    def _render_cloud_groups(self, filter_text=""):
+        """Render cloud groups into tabbed listboxes, filtered by search text."""
+        ft = filter_text.lower()
+
+        self.cloud_security_listbox.delete(0, "end")
+        self.cloud_m365_listbox.delete(0, "end")
+        self.cloud_distribution_listbox.delete(0, "end")
+        self._cloud_security_map = {}
+        self._cloud_m365_map = {}
+        self._cloud_distribution_map = {}
+
+        sec_idx = m365_idx = dist_idx = 0
+        for g in self._cloud_groups_all:
+            name = g.get("display_name", "")
+            desc = g.get("description", "") or ""
+
+            if ft and ft not in name.lower() and ft not in desc.lower():
+                continue
+
+            entry = (g["id"], name)
+            gtype = g.get("group_type", "Security")
+
+            if gtype == "M365":
+                self.cloud_m365_listbox.insert("end", name)
+                self._cloud_m365_map[m365_idx] = entry
+                m365_idx += 1
+            elif gtype == "Distribution":
+                self.cloud_distribution_listbox.insert("end", name)
+                self._cloud_distribution_map[dist_idx] = entry
+                dist_idx += 1
+            else:
+                self.cloud_security_listbox.insert("end", name)
+                self._cloud_security_map[sec_idx] = entry
+                sec_idx += 1
 
     def _load_licenses(self):
         try:
@@ -2088,6 +2281,126 @@ class ProvisioningApp(tk.Tk):
                 text="Not detected \u2014 enter manually or skip sync", foreground="orange")
 
     # -- Event Handlers ----------------------------------------------------
+
+    def _on_ad_group_filter(self, *_args):
+        """Re-render AD groups filtered by search text."""
+        self._render_ad_groups(self.ad_group_filter_var.get().strip())
+
+    def _on_cloud_group_filter(self, *_args):
+        """Re-render cloud groups filtered by search text."""
+        self._render_cloud_groups(self.cloud_group_filter_var.get().strip())
+
+    def _copy_from_user_search(self):
+        """Search AD for a user to copy groups from."""
+        term = self.copy_user_search_var.get().strip()
+        if not term:
+            return
+
+        def search():
+            # Reuse the existing search but also grab UPN
+            safe_term = sanitize_for_powershell(term)
+            script = f"""
+            Import-Module ActiveDirectory
+            Get-ADUser -Filter "Name -like '*{safe_term}*'" -Properties DisplayName, Title, UserPrincipalName |
+              Select-Object -First 20
+                @{{N='display_name';E={{$_.DisplayName}}}},
+                @{{N='dn';E={{$_.DistinguishedName}}}},
+                @{{N='title';E={{$_.Title}}}},
+                @{{N='upn';E={{$_.UserPrincipalName}}}} |
+              ConvertTo-Json -Compress
+            """
+            success, stdout, stderr = run_powershell(script, timeout=15)
+            if not success:
+                return []
+            try:
+                data = json.loads(stdout) if stdout else []
+                if isinstance(data, dict):
+                    data = [data]
+                return data
+            except json.JSONDecodeError:
+                return []
+
+        def on_result(users):
+            self._copy_user_matches = []
+            self.copy_user_results.delete(0, "end")
+            if not users:
+                self.copy_user_results.insert("end", "(no results)")
+                self.copy_user_results.pack(fill="x")
+                return
+            for u in users:
+                display = u.get("display_name", "")
+                title = u.get("title", "")
+                label = f"{display} ({title})" if title else display
+                self._copy_user_matches.append((
+                    display,
+                    u.get("dn", ""),
+                    u.get("upn", ""),
+                ))
+                self.copy_user_results.insert("end", label)
+            self.copy_user_results.pack(fill="x")
+
+        self._run_in_thread(search, on_complete=on_result)
+
+    def _on_copy_user_select(self, event):
+        """When a user is selected from copy-from results, fetch and apply their groups."""
+        selection = self.copy_user_results.curselection()
+        if not selection or not self._copy_user_matches:
+            return
+        idx = selection[0]
+        if idx >= len(self._copy_user_matches):
+            return
+
+        display, user_dn, user_upn = self._copy_user_matches[idx]
+        self.copy_user_results.pack_forget()
+        self.copy_status_label.configure(text=f"Loading groups for {display}...",
+                                          foreground="blue")
+
+        def fetch_groups():
+            ad_group_dns = get_user_ad_groups(user_dn) if user_dn else []
+            cloud_group_ids = get_user_cloud_groups(user_upn) if user_upn else []
+            return ad_group_dns, cloud_group_ids
+
+        def on_result(result):
+            ad_group_dns, cloud_group_ids = result
+            ad_count = self._select_ad_groups_by_dn(ad_group_dns)
+            cloud_count = self._select_cloud_groups_by_id(cloud_group_ids)
+            self.copy_status_label.configure(
+                text=f"Copied {ad_count} AD + {cloud_count} cloud groups from {display}",
+                foreground="green")
+
+        self._run_in_thread(fetch_groups, on_complete=on_result)
+
+    def _select_ad_groups_by_dn(self, group_dns: list) -> int:
+        """Auto-select AD groups across all tabs by DN. Returns count selected."""
+        dn_set = set(d.lower() for d in group_dns)
+        count = 0
+        for idx, dn in self._ad_security_map.items():
+            if dn.lower() in dn_set:
+                self.ad_security_listbox.selection_set(idx)
+                count += 1
+        for idx, dn in self._ad_distribution_map.items():
+            if dn.lower() in dn_set:
+                self.ad_distribution_listbox.selection_set(idx)
+                count += 1
+        return count
+
+    def _select_cloud_groups_by_id(self, group_ids: list) -> int:
+        """Auto-select cloud groups across all tabs by ID. Returns count selected."""
+        id_set = set(group_ids)
+        count = 0
+        for idx, (gid, _) in self._cloud_security_map.items():
+            if gid in id_set:
+                self.cloud_security_listbox.selection_set(idx)
+                count += 1
+        for idx, (gid, _) in self._cloud_m365_map.items():
+            if gid in id_set:
+                self.cloud_m365_listbox.selection_set(idx)
+                count += 1
+        for idx, (gid, _) in self._cloud_distribution_map.items():
+            if gid in id_set:
+                self.cloud_distribution_listbox.selection_set(idx)
+                count += 1
+        return count
 
     def _on_name_change(self, *_args):
         """Auto-generate display name and username when first/last name changes."""
@@ -2253,8 +2566,15 @@ class ProvisioningApp(tk.Tk):
             var.set("")
 
         self.force_change_var.set(True)
-        self.ad_groups_listbox.selection_clear(0, "end")
-        self.cloud_groups_listbox.selection_clear(0, "end")
+        self.ad_security_listbox.selection_clear(0, "end")
+        self.ad_distribution_listbox.selection_clear(0, "end")
+        self.cloud_security_listbox.selection_clear(0, "end")
+        self.cloud_m365_listbox.selection_clear(0, "end")
+        self.cloud_distribution_listbox.selection_clear(0, "end")
+        self.ad_group_filter_var.set("")
+        self.cloud_group_filter_var.set("")
+        self.copy_user_search_var.set("")
+        self.copy_status_label.configure(text="")
         self.license_combo.current(0)
         self.username_status_label.configure(text="")
         self.license_seats_label.configure(text="")
@@ -2413,12 +2733,17 @@ class ProvisioningApp(tk.Tk):
             if not success:
                 results["errors"].append(f"Failed to set manager: {error}")
 
-        # -- Step 3: Add to AD Groups --------------------------------------
-        selected_ad_groups = self.ad_groups_listbox.curselection()
-        if selected_ad_groups and user_dn:
+        # -- Step 3: Add to AD Groups (from all tabs) ----------------------
+        group_dns = []
+        for idx in self.ad_security_listbox.curselection():
+            if idx in self._ad_security_map:
+                group_dns.append(self._ad_security_map[idx])
+        for idx in self.ad_distribution_listbox.curselection():
+            if idx in self._ad_distribution_map:
+                group_dns.append(self._ad_distribution_map[idx])
+
+        if group_dns and user_dn:
             self._update_status_ts("Adding to AD groups...")
-            group_dns = [self._ad_group_map[i] for i in selected_ad_groups
-                        if i in self._ad_group_map]
             group_results = add_user_to_groups(user_dn, group_dns)
             results["groups_added"] = group_results
             for gname, gsuccess, gerror in group_results:
@@ -2428,8 +2753,19 @@ class ProvisioningApp(tk.Tk):
         # -- Step 4: License and Sync --------------------------------------
         lic_selection = self.license_var.get()
         wants_license = lic_selection and not lic_selection.startswith("(None")
-        selected_cloud_groups = self.cloud_groups_listbox.curselection()
-        wants_cloud_groups = len(selected_cloud_groups) > 0
+
+        # Gather cloud groups from all tabs
+        cloud_group_selections = []
+        for idx in self.cloud_security_listbox.curselection():
+            if idx in self._cloud_security_map:
+                cloud_group_selections.append(self._cloud_security_map[idx])
+        for idx in self.cloud_m365_listbox.curselection():
+            if idx in self._cloud_m365_map:
+                cloud_group_selections.append(self._cloud_m365_map[idx])
+        for idx in self.cloud_distribution_listbox.curselection():
+            if idx in self._cloud_distribution_map:
+                cloud_group_selections.append(self._cloud_distribution_map[idx])
+        wants_cloud_groups = len(cloud_group_selections) > 0
 
         ad_domain = cfg["ad_domain"]
         poll_interval = cfg["entra_poll_interval_seconds"]
@@ -2506,12 +2842,8 @@ class ProvisioningApp(tk.Tk):
                     return results
 
                 self._update_status_ts("Adding to cloud groups...")
-                cloud_group_ids = [
-                    self._cloud_group_map[i] for i in selected_cloud_groups
-                    if i in self._cloud_group_map
-                ]
                 cloud_results = add_user_to_cloud_groups(
-                    results["entra_user_id"], cloud_group_ids)
+                    results["entra_user_id"], cloud_group_selections)
                 results["cloud_groups_added"] = cloud_results
                 for gname, gsuccess, gerror in cloud_results:
                     if not gsuccess:
