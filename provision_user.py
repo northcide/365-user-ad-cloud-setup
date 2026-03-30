@@ -1770,6 +1770,355 @@ class ProvisioningApp(tk.Tk):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PREFLIGHT CHECK DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Status constants for preflight checks
+CHECK_PENDING = "pending"
+CHECK_RUNNING = "running"
+CHECK_PASS = "pass"
+CHECK_WARN = "warn"
+CHECK_FAIL = "fail"
+
+
+def _preflight_check_powershell() -> tuple:
+    """Verify powershell.exe is available."""
+    success, stdout, stderr = run_powershell("Write-Output 'OK'", timeout=10)
+    if success and "OK" in stdout:
+        return CHECK_PASS, "PowerShell is available"
+    return CHECK_FAIL, f"PowerShell not available: {stderr[:100]}"
+
+
+def _preflight_check_ad_module() -> tuple:
+    """Verify the ActiveDirectory PowerShell module is installed and loadable."""
+    script = """
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $domain = Get-ADDomain | Select-Object -ExpandProperty DNSRoot
+    Write-Output "DOMAIN:$domain"
+    """
+    success, stdout, stderr = run_powershell(script, timeout=15)
+    if success and "DOMAIN:" in stdout:
+        domain = stdout.split("DOMAIN:")[1].strip()
+        return CHECK_PASS, f"AD module loaded — domain: {domain}"
+    if "not recognized" in stderr.lower() or "not installed" in stderr.lower():
+        return CHECK_FAIL, "ActiveDirectory module not installed. Install RSAT or run on a DC."
+    return CHECK_FAIL, f"AD module error: {stderr[:150]}"
+
+
+def _preflight_check_ad_permissions() -> tuple:
+    """Verify the current user can query AD (read OUs as a basic permission test)."""
+    script = """
+    Import-Module ActiveDirectory
+    $count = (Get-ADOrganizationalUnit -Filter * | Measure-Object).Count
+    Write-Output "OUS:$count"
+    """
+    success, stdout, stderr = run_powershell(script, timeout=15)
+    if success and "OUS:" in stdout:
+        count = stdout.split("OUS:")[1].strip()
+        return CHECK_PASS, f"AD read access confirmed — {count} OUs found"
+    if "access" in stderr.lower() or "denied" in stderr.lower():
+        return CHECK_FAIL, "Insufficient AD permissions. Run as a Domain Admin."
+    return CHECK_WARN, f"Could not verify AD permissions: {stderr[:150]}"
+
+
+def _preflight_check_network() -> tuple:
+    """Verify network connectivity to Microsoft Graph and login endpoints."""
+    endpoints = [
+        ("login.microsoftonline.com", "Entra ID login"),
+        ("graph.microsoft.com", "Microsoft Graph"),
+    ]
+    results = []
+    for host, label in endpoints:
+        try:
+            resp = requests.get(f"https://{host}", timeout=10, allow_redirects=True)
+            results.append((label, True, resp.status_code))
+        except requests.RequestException as e:
+            results.append((label, False, str(e)[:80]))
+
+    all_ok = all(r[1] for r in results)
+    if all_ok:
+        return CHECK_PASS, "Network connectivity to Microsoft endpoints confirmed"
+
+    failed = [f"{label}: {err}" for label, ok, err in results if not ok]
+    return CHECK_FAIL, "Network unreachable: " + "; ".join(failed)
+
+
+def _preflight_check_certificate() -> tuple:
+    """Verify the Graph API certificate file exists and is readable."""
+    if not os.path.isfile(GRAPH_CERT_PATH):
+        return CHECK_FAIL, (
+            f"Certificate not found at {GRAPH_CERT_PATH}\n"
+            "Create an App Registration certificate and place the PEM file there."
+        )
+
+    try:
+        with open(GRAPH_CERT_PATH, "r") as f:
+            content = f.read(100)
+        if "PRIVATE KEY" in content or "BEGIN" in content:
+            return CHECK_PASS, f"Certificate found: {GRAPH_CERT_PATH}"
+        return CHECK_WARN, "File exists but may not be a valid PEM certificate"
+    except OSError as e:
+        return CHECK_FAIL, f"Cannot read certificate: {e}"
+
+
+def _preflight_check_graph_auth() -> tuple:
+    """Verify Microsoft Graph authentication works (acquire a token)."""
+    try:
+        token = get_graph_token()
+        if token:
+            return CHECK_PASS, "Graph API authentication successful"
+        return CHECK_FAIL, "Token acquisition returned empty"
+    except RuntimeError as e:
+        msg = str(e)
+        if "Certificate not found" in msg:
+            return CHECK_FAIL, msg
+        if "AADSTS" in msg:
+            # Azure AD error codes — extract the useful part
+            return CHECK_FAIL, f"Entra ID auth error: {msg[:200]}"
+        return CHECK_FAIL, f"Graph auth failed: {msg[:200]}"
+    except Exception as e:
+        return CHECK_FAIL, f"Graph auth error: {e}"
+
+
+def _preflight_check_graph_permissions() -> tuple:
+    """Verify the app has the required Graph API permissions by testing key endpoints."""
+    try:
+        headers = _graph_headers()
+
+        # Test 1: Can we read subscribed SKUs? (requires Organization.Read.All)
+        resp = requests.get(
+            "https://graph.microsoft.com/v1.0/subscribedSkus",
+            headers=headers, timeout=15,
+        )
+        if resp.status_code == 403:
+            return CHECK_FAIL, "Missing permission: Organization.Read.All (cannot read licenses)"
+        if resp.status_code == 401:
+            return CHECK_FAIL, "Authentication rejected — check App Registration config"
+
+        # Test 2: Can we read groups? (requires Group.ReadWrite.All)
+        resp2 = requests.get(
+            "https://graph.microsoft.com/v1.0/groups?$top=1",
+            headers=headers, timeout=15,
+        )
+        if resp2.status_code == 403:
+            return CHECK_WARN, "Licenses OK, but missing Group.ReadWrite.All (cloud groups won't work)"
+
+        return CHECK_PASS, "Graph API permissions verified (licenses + groups)"
+    except requests.RequestException as e:
+        return CHECK_WARN, f"Could not verify Graph permissions: {e}"
+
+
+def _preflight_check_adsync() -> tuple:
+    """Detect and verify the Entra Connect sync server."""
+    server, method = detect_sync_server()
+    if server:
+        return CHECK_PASS, f"Entra Connect found: {server} (detected via {method})"
+    return CHECK_WARN, (
+        "Entra Connect server not detected. You can enter it manually in the GUI "
+        "or skip sync and trigger it yourself."
+    )
+
+
+# Ordered list of preflight checks: (name, display_label, check_function, is_required)
+PREFLIGHT_CHECKS = [
+    ("powershell",     "PowerShell",                  _preflight_check_powershell,      True),
+    ("ad_module",      "AD PowerShell Module",        _preflight_check_ad_module,       True),
+    ("ad_permissions", "AD Permissions",              _preflight_check_ad_permissions,  True),
+    ("network",        "Network Connectivity",        _preflight_check_network,         True),
+    ("certificate",    "Graph API Certificate",       _preflight_check_certificate,     True),
+    ("graph_auth",     "Microsoft 365 Login",         _preflight_check_graph_auth,      True),
+    ("graph_perms",    "Graph API Permissions",        _preflight_check_graph_permissions, False),
+    ("adsync",         "Entra Connect Sync Server",   _preflight_check_adsync,          False),
+]
+
+
+class PreflightDialog(tk.Tk):
+    """
+    Startup dialog that runs environment checks before launching the main app.
+
+    Shows a checklist with real-time status indicators. Required checks must pass
+    to proceed; warnings allow continuing with reduced functionality.
+    """
+
+    ICON = {
+        CHECK_PENDING: "\u2022",   # bullet
+        CHECK_RUNNING: "\u25CB",   # circle
+        CHECK_PASS:    "\u2714",   # checkmark
+        CHECK_WARN:    "\u26A0",   # warning
+        CHECK_FAIL:    "\u2718",   # X
+    }
+    COLOR = {
+        CHECK_PENDING: "gray",
+        CHECK_RUNNING: "blue",
+        CHECK_PASS:    "green",
+        CHECK_WARN:    "orange",
+        CHECK_FAIL:    "red",
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.title("Preflight Check — 365 User Provisioning")
+        self.geometry("620x480")
+        self.resizable(False, False)
+
+        self._checks_passed = False
+        self._check_rows = {}   # name -> (icon_label, text_label, detail_label)
+        self._results = {}      # name -> (status, message)
+
+        self._build_ui()
+        self.after(200, self._run_checks)
+
+    def _build_ui(self):
+        # Header
+        header = ttk.Label(self, text="Preflight Environment Check",
+                           font=("Segoe UI", 14, "bold"))
+        header.pack(pady=(15, 5))
+        ttk.Label(self, text="Verifying requirements before launch...",
+                  foreground="gray").pack(pady=(0, 10))
+
+        # Checklist frame
+        checklist = ttk.Frame(self, padding=10)
+        checklist.pack(fill="both", expand=True, padx=20)
+
+        for i, (name, label, _func, required) in enumerate(PREFLIGHT_CHECKS):
+            icon_lbl = ttk.Label(checklist, text=self.ICON[CHECK_PENDING],
+                                  foreground=self.COLOR[CHECK_PENDING],
+                                  font=("Segoe UI", 12))
+            icon_lbl.grid(row=i, column=0, padx=(0, 8), pady=3, sticky="w")
+
+            req_tag = " *" if required else ""
+            text_lbl = ttk.Label(checklist, text=f"{label}{req_tag}",
+                                  font=("Segoe UI", 10))
+            text_lbl.grid(row=i, column=1, pady=3, sticky="w")
+
+            detail_lbl = ttk.Label(checklist, text="", foreground="gray",
+                                    font=("Segoe UI", 9), wraplength=350)
+            detail_lbl.grid(row=i, column=2, padx=(15, 0), pady=3, sticky="w")
+
+            self._check_rows[name] = (icon_lbl, text_lbl, detail_lbl)
+
+        # Legend
+        ttk.Label(checklist, text="* = required",
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=len(PREFLIGHT_CHECKS), column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        # Progress bar
+        self.progress = ttk.Progressbar(self, maximum=len(PREFLIGHT_CHECKS), mode="determinate")
+        self.progress.pack(fill="x", padx=20, pady=(5, 10))
+
+        # Buttons
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=(0, 15))
+
+        self.continue_btn = ttk.Button(btn_frame, text="Continue", state="disabled",
+                                        command=self._on_continue)
+        self.continue_btn.pack(side="left", padx=5)
+
+        self.retry_btn = ttk.Button(btn_frame, text="Retry", state="disabled",
+                                     command=self._on_retry)
+        self.retry_btn.pack(side="left", padx=5)
+
+        ttk.Button(btn_frame, text="Quit", command=self._on_quit).pack(side="left", padx=5)
+
+        # Status summary
+        self.summary_label = ttk.Label(self, text="", font=("Segoe UI", 10))
+        self.summary_label.pack(pady=(0, 10))
+
+    def _update_check(self, name: str, status: str, detail: str = ""):
+        """Update a check row's icon, color, and detail text."""
+        icon_lbl, text_lbl, detail_lbl = self._check_rows[name]
+        icon_lbl.configure(text=self.ICON[status], foreground=self.COLOR[status])
+        detail_lbl.configure(text=detail, foreground=self.COLOR[status])
+        self._results[name] = (status, detail)
+
+    def _run_checks(self):
+        """Run all preflight checks sequentially in a background thread."""
+        self.continue_btn.configure(state="disabled")
+        self.retry_btn.configure(state="disabled")
+        self.progress["value"] = 0
+
+        # Reset all to pending
+        for name, _, _, _ in PREFLIGHT_CHECKS:
+            self._update_check(name, CHECK_PENDING)
+
+        def worker():
+            for i, (name, label, func, required) in enumerate(PREFLIGHT_CHECKS):
+                self.after(0, self._update_check, name, CHECK_RUNNING, "Checking...")
+
+                try:
+                    status, message = func()
+                except Exception as e:
+                    status = CHECK_FAIL
+                    message = f"Unexpected error: {e}"
+                    logger.exception("Preflight check '%s' crashed", name)
+
+                logger.info("Preflight [%s]: %s — %s", name, status, message)
+                self.after(0, self._update_check, name, status, message)
+                self.after(0, self._advance_progress, i + 1)
+
+            self.after(0, self._checks_complete)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _advance_progress(self, value):
+        self.progress["value"] = value
+
+    def _checks_complete(self):
+        """Evaluate results and enable/disable buttons."""
+        required_failed = []
+        warnings = []
+
+        for name, label, _func, required in PREFLIGHT_CHECKS:
+            status, message = self._results.get(name, (CHECK_FAIL, "Did not run"))
+            if status == CHECK_FAIL and required:
+                required_failed.append(label)
+            elif status == CHECK_WARN:
+                warnings.append(label)
+
+        self.retry_btn.configure(state="normal")
+
+        if required_failed:
+            self._checks_passed = False
+            self.continue_btn.configure(state="disabled")
+            self.summary_label.configure(
+                text=f"BLOCKED: {len(required_failed)} required check(s) failed",
+                foreground="red")
+        elif warnings:
+            self._checks_passed = True
+            self.continue_btn.configure(state="normal")
+            self.summary_label.configure(
+                text=f"READY with {len(warnings)} warning(s) — some features may be limited",
+                foreground="orange")
+        else:
+            self._checks_passed = True
+            self.continue_btn.configure(state="normal")
+            self.summary_label.configure(
+                text="ALL CHECKS PASSED — ready to launch",
+                foreground="green")
+
+    def _on_continue(self):
+        """Close preflight and signal to launch the main app."""
+        self.destroy()
+
+    def _on_retry(self):
+        """Re-run all checks."""
+        # Clear Graph token cache so auth is re-tested
+        _graph_token_cache["token"] = None
+        _graph_token_cache["expires_at"] = 0
+        _detected_sync_server["checked"] = False
+        self._run_checks()
+
+    def _on_quit(self):
+        """Exit the application."""
+        self._checks_passed = False
+        self.destroy()
+
+    @property
+    def passed(self) -> bool:
+        return self._checks_passed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1779,6 +2128,17 @@ def main():
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
     logger.info("=" * 60)
 
+    # Run preflight checks
+    preflight = PreflightDialog()
+    preflight.mainloop()
+
+    if not preflight.passed:
+        logger.info("Preflight checks failed or user quit — exiting")
+        return
+
+    logger.info("Preflight passed — launching main application")
+
+    # Launch main application
     app = ProvisioningApp()
     app.mainloop()
 
