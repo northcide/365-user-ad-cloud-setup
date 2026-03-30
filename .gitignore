@@ -1,0 +1,19 @@
+# Build artifacts
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# Certificates and secrets
+*.pem
+*.pfx
+*.cer
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
