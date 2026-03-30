@@ -93,7 +93,7 @@ REQUIRED_CONFIG_KEYS = [
 GRAPH_SCOPES = ["https://graph.microsoft.com/.default"]
 
 # UI constants — not customer-specific
-WINDOW_SIZE = "800x950"
+WINDOW_SIZE = "1050x720"
 
 
 def load_config() -> dict:
@@ -1693,40 +1693,50 @@ class ProvisioningApp(tk.Tk):
     # -- UI Construction ---------------------------------------------------
 
     def _build_ui(self):
-        """Construct the full GUI layout."""
+        """Construct the full GUI layout in a two-column, landscape format."""
 
-        # Main scrollable area
-        container = ttk.Frame(self)
-        container.pack(fill="both", expand=True)
+        # -- Progress & Status (bottom, always visible) --------------------
+        status_frame = ttk.Frame(self, padding=(10, 3))
+        status_frame.pack(fill="x", side="bottom")
 
-        canvas = tk.Canvas(container, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        self._scroll_frame = ttk.Frame(canvas)
+        self.progress_bar = ttk.Progressbar(status_frame, mode="indeterminate")
+        self.progress_bar.pack(fill="x")
+        self.status_label = ttk.Label(status_frame, text="Ready", foreground="gray")
+        self.status_label.pack(fill="x", pady=(2, 0))
 
-        self._scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # -- Action Buttons (bottom, above status) -------------------------
+        action_frame = ttk.Frame(self, padding=(10, 5))
+        action_frame.pack(fill="x", side="bottom")
 
-        canvas.create_window((0, 0), window=self._scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        self.provision_btn = ttk.Button(action_frame, text="Provision User",
+                                         command=self._on_provision_click)
+        self.provision_btn.pack(side="left", padx=(0, 10))
+        ttk.Button(action_frame, text="Clear Form",
+                    command=self._clear_form).pack(side="left")
+        self.cancel_btn = ttk.Button(action_frame, text="Cancel", state="disabled",
+                                      command=self._on_cancel_click)
+        self.cancel_btn.pack(side="left", padx=(10, 0))
 
-        # Enable mousewheel scrolling
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # -- Main two-column layout ----------------------------------------
+        main = ttk.Frame(self, padding=5)
+        main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=1)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, sticky="nsew", padx=(5, 3))
+        right = ttk.Frame(main)
+        right.grid(row=0, column=1, sticky="nsew", padx=(3, 5))
 
-        parent = self._scroll_frame
-        pad = {"padx": 10, "pady": 5}
+        p = {"padx": 0, "pady": 3}
+        email_domains = cfg.get("email_domains", [])
+
+        # ===================== LEFT COLUMN ================================
 
         # -- User Information ----------------------------------------------
-        frame_user = ttk.LabelFrame(parent, text=" User Information ", padding=10)
-        frame_user.pack(fill="x", **pad)
+        frame_user = ttk.LabelFrame(left, text=" User Information ", padding=8)
+        frame_user.pack(fill="x", **p)
 
-        email_domains = cfg.get("email_domains", [])
         self.first_name_var = tk.StringVar()
         self.last_name_var = tk.StringVar()
         self.display_name_var = tk.StringVar()
@@ -1736,71 +1746,144 @@ class ProvisioningApp(tk.Tk):
         self.job_title_var = tk.StringVar()
         self.department_var = tk.StringVar()
 
-        # Auto-generate display name and username on name change
         self.first_name_var.trace_add("write", self._on_name_change)
         self.last_name_var.trace_add("write", self._on_name_change)
 
-        # Row 0: First/Last Name
-        ttk.Label(frame_user, text="First Name *").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame_user, textvariable=self.first_name_var, width=25).grid(
-            row=0, column=1, sticky="w", padx=(0, 15))
-        ttk.Label(frame_user, text="Last Name *").grid(row=0, column=2, sticky="w")
-        ttk.Entry(frame_user, textvariable=self.last_name_var, width=25).grid(
-            row=0, column=3, sticky="w")
+        r = 0
+        ttk.Label(frame_user, text="First Name *").grid(row=r, column=0, sticky="w")
+        ttk.Entry(frame_user, textvariable=self.first_name_var, width=20).grid(
+            row=r, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(frame_user, text="Last Name *").grid(row=r, column=2, sticky="w")
+        ttk.Entry(frame_user, textvariable=self.last_name_var, width=20).grid(
+            row=r, column=3, sticky="ew")
 
-        # Row 1: Display Name
-        ttk.Label(frame_user, text="Display Name *").grid(row=1, column=0, sticky="w", pady=(5, 0))
-        ttk.Entry(frame_user, textvariable=self.display_name_var, width=40).grid(
-            row=1, column=1, columnspan=3, sticky="w", pady=(5, 0))
-
-        # Row 2: Username + Check button
-        ttk.Label(frame_user, text="Username *").grid(row=2, column=0, sticky="w", pady=(5, 0))
-        ttk.Entry(frame_user, textvariable=self.username_var, width=25).grid(
-            row=2, column=1, sticky="w", pady=(5, 0))
-        self.check_user_btn = ttk.Button(frame_user, text="Check", width=8,
-                                          command=self._check_username)
-        self.check_user_btn.grid(row=2, column=2, sticky="w", pady=(5, 0))
-        self.username_status_label = ttk.Label(frame_user, text="")
-        self.username_status_label.grid(row=2, column=3, sticky="w", pady=(5, 0))
-
-        # Row 3: Email Domain
-        ttk.Label(frame_user, text="Email Domain *").grid(row=3, column=0, sticky="w", pady=(5, 0))
+        r += 1
+        ttk.Label(frame_user, text="Display Name *").grid(row=r, column=0, sticky="w", pady=(3, 0))
+        ttk.Entry(frame_user, textvariable=self.display_name_var, width=20).grid(
+            row=r, column=1, sticky="ew", pady=(3, 0), padx=(0, 8))
+        ttk.Label(frame_user, text="Email *").grid(row=r, column=2, sticky="w", pady=(3, 0))
         email_combo = ttk.Combobox(frame_user, textvariable=self.email_domain_var,
-                                    values=email_domains, width=25, state="readonly")
-        email_combo.grid(row=3, column=1, sticky="w", pady=(5, 0))
+                                    values=email_domains, width=17, state="readonly")
+        email_combo.grid(row=r, column=3, sticky="ew", pady=(3, 0))
 
-        # Row 4: Job Title / Department
-        ttk.Label(frame_user, text="Job Title").grid(row=4, column=0, sticky="w", pady=(5, 0))
-        ttk.Entry(frame_user, textvariable=self.job_title_var, width=25).grid(
-            row=4, column=1, sticky="w", pady=(5, 0))
-        ttk.Label(frame_user, text="Department").grid(row=4, column=2, sticky="w", pady=(5, 0))
-        ttk.Entry(frame_user, textvariable=self.department_var, width=25).grid(
-            row=4, column=3, sticky="w", pady=(5, 0))
+        r += 1
+        ttk.Label(frame_user, text="Username *").grid(row=r, column=0, sticky="w", pady=(3, 0))
+        ttk.Entry(frame_user, textvariable=self.username_var, width=20).grid(
+            row=r, column=1, sticky="ew", pady=(3, 0), padx=(0, 8))
+        self.check_user_btn = ttk.Button(frame_user, text="Check", width=7,
+                                          command=self._check_username)
+        self.check_user_btn.grid(row=r, column=2, sticky="w", pady=(3, 0))
+        self.username_status_label = ttk.Label(frame_user, text="")
+        self.username_status_label.grid(row=r, column=3, sticky="w", pady=(3, 0))
 
-        # -- Active Directory ----------------------------------------------
-        frame_ad = ttk.LabelFrame(parent, text=" Active Directory ", padding=10)
-        frame_ad.pack(fill="x", **pad)
+        r += 1
+        ttk.Label(frame_user, text="Job Title").grid(row=r, column=0, sticky="w", pady=(3, 0))
+        ttk.Entry(frame_user, textvariable=self.job_title_var, width=20).grid(
+            row=r, column=1, sticky="ew", pady=(3, 0), padx=(0, 8))
+        ttk.Label(frame_user, text="Department").grid(row=r, column=2, sticky="w", pady=(3, 0))
+        ttk.Entry(frame_user, textvariable=self.department_var, width=20).grid(
+            row=r, column=3, sticky="ew", pady=(3, 0))
 
-        # OU Selection
+        frame_user.columnconfigure(1, weight=1)
+        frame_user.columnconfigure(3, weight=1)
+
+        # -- Password ------------------------------------------------------
+        frame_pw = ttk.LabelFrame(left, text=" Password ", padding=8)
+        frame_pw.pack(fill="x", **p)
+
+        self.password_var = tk.StringVar()
+        self.password_confirm_var = tk.StringVar()
+        self.force_change_var = tk.BooleanVar(value=True)
+
+        ttk.Label(frame_pw, text="Password *").grid(row=0, column=0, sticky="w")
+        pw_entry = ttk.Entry(frame_pw, textvariable=self.password_var, show="*", width=22)
+        pw_entry.grid(row=0, column=1, sticky="ew")
+        self._show_pw_var = tk.BooleanVar(value=False)
+        self._pw_entry = pw_entry
+        ttk.Checkbutton(frame_pw, text="Show", variable=self._show_pw_var,
+                         command=self._toggle_password_visibility).grid(row=0, column=2, padx=(3, 0))
+        ttk.Button(frame_pw, text="Generate", width=8,
+                    command=self._generate_password).grid(row=0, column=3, padx=(3, 0))
+
+        ttk.Label(frame_pw, text="Confirm *").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        self._pw_confirm_entry = ttk.Entry(frame_pw, textvariable=self.password_confirm_var,
+                                            show="*", width=22)
+        self._pw_confirm_entry.grid(row=1, column=1, sticky="ew", pady=(3, 0))
+        self.pw_strength_label = ttk.Label(frame_pw, text="", foreground="gray")
+        self.pw_strength_label.grid(row=1, column=2, columnspan=2, sticky="w", padx=(5, 0), pady=(3, 0))
+        self.password_var.trace_add("write", self._on_password_change)
+
+        ttk.Checkbutton(frame_pw, text="Force password change at next logon",
+                         variable=self.force_change_var).grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
+        frame_pw.columnconfigure(1, weight=1)
+
+        # -- Microsoft 365 Licensing ---------------------------------------
+        frame_lic = ttk.LabelFrame(left, text=" Microsoft 365 Licensing ", padding=8)
+        frame_lic.pack(fill="x", **p)
+
+        self.license_var = tk.StringVar()
+        ttk.Label(frame_lic, text="License").grid(row=0, column=0, sticky="w")
+        lic_row = ttk.Frame(frame_lic)
+        lic_row.grid(row=0, column=1, sticky="ew")
+        self.license_combo = ttk.Combobox(lic_row, textvariable=self.license_var,
+                                           width=35, state="readonly")
+        self.license_combo.pack(side="left", fill="x", expand=True)
+        self.license_combo.bind("<<ComboboxSelected>>", self._on_license_change)
+        ttk.Button(lic_row, text="Refresh", width=7,
+                    command=self._refresh_licenses).pack(side="left", padx=(3, 0))
+
+        self.license_seats_label = ttk.Label(frame_lic, text="", foreground="gray")
+        self.license_seats_label.grid(row=1, column=1, sticky="w")
+
+        self.service_plans_frame = ttk.Frame(frame_lic)
+        self.service_plans_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self._service_plan_vars = {}
+        frame_lic.columnconfigure(1, weight=1)
+
+        # -- Entra Connect Sync --------------------------------------------
+        frame_sync = ttk.LabelFrame(left, text=" Entra Connect Sync ", padding=8)
+        frame_sync.pack(fill="x", **p)
+
+        self.sync_server_label = ttk.Label(frame_sync, text="Detecting...", foreground="gray")
+        self.sync_server_label.grid(row=0, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(frame_sync, text="Override:").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        self.sync_server_override_var = tk.StringVar()
+        ttk.Entry(frame_sync, textvariable=self.sync_server_override_var, width=25).grid(
+            row=1, column=1, sticky="ew", pady=(3, 0))
+
+        self.skip_sync_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame_sync, text="Skip sync",
+                         variable=self.skip_sync_var).grid(
+            row=1, column=2, sticky="w", padx=(8, 0), pady=(3, 0))
+        frame_sync.columnconfigure(1, weight=1)
+
+        # ===================== RIGHT COLUMN ===============================
+
+        # -- Active Directory (OU + Groups + Manager) ----------------------
+        frame_ad = ttk.LabelFrame(right, text=" Active Directory ", padding=8)
+        frame_ad.pack(fill="both", expand=True, **p)
+
         self.ou_var = tk.StringVar()
-        ttk.Label(frame_ad, text="Organizational Unit *").grid(row=0, column=0, sticky="w")
-        self.ou_combo = ttk.Combobox(frame_ad, textvariable=self.ou_var, width=55, state="readonly")
-        self.ou_combo.grid(row=0, column=1, columnspan=3, sticky="w")
-        self._ou_map = {}  # canonical -> dn
+        ttk.Label(frame_ad, text="OU *").grid(row=0, column=0, sticky="w")
+        self.ou_combo = ttk.Combobox(frame_ad, textvariable=self.ou_var, width=45, state="readonly")
+        self.ou_combo.grid(row=0, column=1, columnspan=2, sticky="ew")
+        self._ou_map = {}
 
-        # AD Security Groups (multi-select)
-        ttk.Label(frame_ad, text="AD Groups\n(on-prem)").grid(row=1, column=0, sticky="nw", pady=(5, 0))
-        groups_frame = ttk.Frame(frame_ad)
-        groups_frame.grid(row=1, column=1, columnspan=3, sticky="w", pady=(5, 0))
+        # AD Security Groups
+        ttk.Label(frame_ad, text="AD Groups").grid(row=1, column=0, sticky="nw", pady=(5, 0))
+        ad_grp_frame = ttk.Frame(frame_ad)
+        ad_grp_frame.grid(row=1, column=1, columnspan=2, sticky="nsew", pady=(5, 0))
 
-        self.ad_groups_listbox = tk.Listbox(groups_frame, selectmode="multiple",
-                                             height=6, width=50, exportselection=False)
-        groups_scroll = ttk.Scrollbar(groups_frame, orient="vertical",
+        self.ad_groups_listbox = tk.Listbox(ad_grp_frame, selectmode="multiple",
+                                             height=5, exportselection=False)
+        groups_scroll = ttk.Scrollbar(ad_grp_frame, orient="vertical",
                                        command=self.ad_groups_listbox.yview)
         self.ad_groups_listbox.configure(yscrollcommand=groups_scroll.set)
-        self.ad_groups_listbox.pack(side="left", fill="both")
+        self.ad_groups_listbox.pack(side="left", fill="both", expand=True)
         groups_scroll.pack(side="left", fill="y")
-        self._ad_group_map = {}  # index -> dn
+        self._ad_group_map = {}
 
         # Manager search
         self.manager_search_var = tk.StringVar()
@@ -1809,150 +1892,43 @@ class ProvisioningApp(tk.Tk):
 
         ttk.Label(frame_ad, text="Manager").grid(row=2, column=0, sticky="w", pady=(5, 0))
         mgr_frame = ttk.Frame(frame_ad)
-        mgr_frame.grid(row=2, column=1, columnspan=3, sticky="w", pady=(5, 0))
+        mgr_frame.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Entry(mgr_frame, textvariable=self.manager_search_var, width=22).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(mgr_frame, text="Search", width=7,
+                    command=self._search_manager).pack(side="left", padx=(3, 0))
 
-        ttk.Entry(mgr_frame, textvariable=self.manager_search_var, width=30).pack(side="left")
-        ttk.Button(mgr_frame, text="Search", width=8,
-                    command=self._search_manager).pack(side="left", padx=(5, 0))
-        self.manager_selected_label = ttk.Label(mgr_frame, textvariable=self.manager_display_var,
+        self.manager_selected_label = ttk.Label(frame_ad, textvariable=self.manager_display_var,
                                                   foreground="green")
-        self.manager_selected_label.pack(side="left", padx=(10, 0))
+        self.manager_selected_label.grid(row=3, column=1, columnspan=2, sticky="w")
 
-        # Manager search results (shown dynamically)
-        self.manager_results_listbox = tk.Listbox(frame_ad, height=4, width=55,
-                                                    exportselection=False)
-        self.manager_results_listbox.grid(row=3, column=1, columnspan=3, sticky="w")
-        self.manager_results_listbox.grid_remove()  # Hidden by default
+        self.manager_results_listbox = tk.Listbox(frame_ad, height=3, exportselection=False)
+        self.manager_results_listbox.grid(row=4, column=1, columnspan=2, sticky="ew")
+        self.manager_results_listbox.grid_remove()
         self.manager_results_listbox.bind("<<ListboxSelect>>", self._on_manager_select)
-        self._manager_results = []  # list of (display, dn)
+        self._manager_results = []
+
+        frame_ad.columnconfigure(1, weight=1)
+        frame_ad.rowconfigure(1, weight=1)
 
         # -- Cloud Groups (Entra ID) --------------------------------------
-        frame_cloud = ttk.LabelFrame(parent, text=" Cloud Groups (Entra ID Only) ", padding=10)
-        frame_cloud.pack(fill="x", **pad)
-
-        ttk.Label(frame_cloud, text="Assigned after\nEntra sync").grid(
-            row=0, column=0, sticky="nw")
+        frame_cloud = ttk.LabelFrame(right, text=" Cloud Groups (Entra ID) ", padding=8)
+        frame_cloud.pack(fill="both", expand=True, **p)
 
         cloud_grp_frame = ttk.Frame(frame_cloud)
-        cloud_grp_frame.grid(row=0, column=1, sticky="w")
+        cloud_grp_frame.pack(fill="both", expand=True)
 
         self.cloud_groups_listbox = tk.Listbox(cloud_grp_frame, selectmode="multiple",
-                                                height=6, width=50, exportselection=False)
+                                                height=5, exportselection=False)
         cloud_scroll = ttk.Scrollbar(cloud_grp_frame, orient="vertical",
                                       command=self.cloud_groups_listbox.yview)
         self.cloud_groups_listbox.configure(yscrollcommand=cloud_scroll.set)
-        self.cloud_groups_listbox.pack(side="left", fill="both")
+        self.cloud_groups_listbox.pack(side="left", fill="both", expand=True)
         cloud_scroll.pack(side="left", fill="y")
-        self._cloud_group_map = {}  # index -> (id, display_name)
+        self._cloud_group_map = {}
 
         self.cloud_groups_status = ttk.Label(frame_cloud, text="Loading...", foreground="gray")
-        self.cloud_groups_status.grid(row=1, column=1, sticky="w")
-
-        # -- Password ------------------------------------------------------
-        frame_pw = ttk.LabelFrame(parent, text=" Password ", padding=10)
-        frame_pw.pack(fill="x", **pad)
-
-        self.password_var = tk.StringVar()
-        self.password_confirm_var = tk.StringVar()
-        self.force_change_var = tk.BooleanVar(value=True)
-
-        # Password field + generate
-        ttk.Label(frame_pw, text="Password *").grid(row=0, column=0, sticky="w")
-        pw_entry = ttk.Entry(frame_pw, textvariable=self.password_var, show="*", width=30)
-        pw_entry.grid(row=0, column=1, sticky="w")
-        ttk.Button(frame_pw, text="Generate", width=10,
-                    command=self._generate_password).grid(row=0, column=2, padx=(5, 0))
-
-        # Show/hide toggle
-        self._show_pw_var = tk.BooleanVar(value=False)
-        self._pw_entry = pw_entry
-        ttk.Checkbutton(frame_pw, text="Show", variable=self._show_pw_var,
-                         command=self._toggle_password_visibility).grid(row=0, column=3, padx=(5, 0))
-
-        # Confirm
-        ttk.Label(frame_pw, text="Confirm *").grid(row=1, column=0, sticky="w", pady=(5, 0))
-        self._pw_confirm_entry = ttk.Entry(frame_pw, textvariable=self.password_confirm_var,
-                                            show="*", width=30)
-        self._pw_confirm_entry.grid(row=1, column=1, sticky="w", pady=(5, 0))
-
-        # Strength indicator
-        self.pw_strength_label = ttk.Label(frame_pw, text="", foreground="gray")
-        self.pw_strength_label.grid(row=2, column=1, sticky="w", pady=(2, 0))
-        self.password_var.trace_add("write", self._on_password_change)
-
-        # Force change checkbox
-        ttk.Checkbutton(frame_pw, text="Force password change at next logon",
-                         variable=self.force_change_var).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
-
-        # -- Microsoft 365 Licensing ---------------------------------------
-        frame_lic = ttk.LabelFrame(parent, text=" Microsoft 365 Licensing ", padding=10)
-        frame_lic.pack(fill="x", **pad)
-
-        self.license_var = tk.StringVar()
-
-        ttk.Label(frame_lic, text="License").grid(row=0, column=0, sticky="w")
-        lic_row = ttk.Frame(frame_lic)
-        lic_row.grid(row=0, column=1, columnspan=3, sticky="w")
-
-        self.license_combo = ttk.Combobox(lic_row, textvariable=self.license_var,
-                                           width=40, state="readonly")
-        self.license_combo.pack(side="left")
-        self.license_combo.bind("<<ComboboxSelected>>", self._on_license_change)
-        ttk.Button(lic_row, text="Refresh", width=8,
-                    command=self._refresh_licenses).pack(side="left", padx=(5, 0))
-
-        # Seat availability label
-        self.license_seats_label = ttk.Label(frame_lic, text="", foreground="gray")
-        self.license_seats_label.grid(row=1, column=1, sticky="w")
-
-        # Service plans frame (dynamic checkbuttons)
-        self.service_plans_frame = ttk.Frame(frame_lic)
-        self.service_plans_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
-        self._service_plan_vars = {}  # plan_id -> BooleanVar (True = disabled)
-
-        # -- Sync Server Status --------------------------------------------
-        frame_sync = ttk.LabelFrame(parent, text=" Entra Connect Sync ", padding=10)
-        frame_sync.pack(fill="x", **pad)
-
-        self.sync_server_label = ttk.Label(frame_sync, text="Detecting sync server...",
-                                            foreground="gray")
-        self.sync_server_label.grid(row=0, column=0, columnspan=2, sticky="w")
-
-        # Manual override entry
-        ttk.Label(frame_sync, text="Override:").grid(row=1, column=0, sticky="w", pady=(5, 0))
-        self.sync_server_override_var = tk.StringVar()
-        ttk.Entry(frame_sync, textvariable=self.sync_server_override_var, width=35).grid(
-            row=1, column=1, sticky="w", pady=(5, 0))
-        ttk.Label(frame_sync, text="(leave empty to use auto-detected)",
-                   foreground="gray").grid(row=1, column=2, sticky="w", pady=(5, 0), padx=(5, 0))
-
-        self.skip_sync_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame_sync, text="Skip sync (I'll trigger it manually)",
-                         variable=self.skip_sync_var).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
-
-        # -- Action Buttons ------------------------------------------------
-        frame_actions = ttk.Frame(parent, padding=10)
-        frame_actions.pack(fill="x", padx=10)
-
-        self.provision_btn = ttk.Button(frame_actions, text="Provision User",
-                                         command=self._on_provision_click)
-        self.provision_btn.pack(side="left", padx=(0, 10))
-        ttk.Button(frame_actions, text="Clear Form",
-                    command=self._clear_form).pack(side="left")
-        self.cancel_btn = ttk.Button(frame_actions, text="Cancel", state="disabled",
-                                      command=self._on_cancel_click)
-        self.cancel_btn.pack(side="left", padx=(10, 0))
-
-        # -- Progress & Status ---------------------------------------------
-        status_frame = ttk.Frame(self, padding=(10, 5))
-        status_frame.pack(fill="x", side="bottom")
-
-        self.progress_bar = ttk.Progressbar(status_frame, mode="indeterminate", length=400)
-        self.progress_bar.pack(fill="x")
-        self.status_label = ttk.Label(status_frame, text="Ready", foreground="gray")
-        self.status_label.pack(fill="x", pady=(2, 0))
+        self.cloud_groups_status.pack(anchor="w")
 
     # -- Startup Data Loading ----------------------------------------------
 
