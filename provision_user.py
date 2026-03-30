@@ -467,29 +467,43 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     safe_sam = sanitize_for_powershell(sam_account_name)
     logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
 
-    # Keep it simple — exactly what works in interactive PowerShell.
-    # Use a one-liner to avoid any f-string brace escaping issues.
+    # Write results to a temp file to avoid stdout/stderr CLIXML issues.
+    # PowerShell on some DCs redirects pipeline output to stderr as CLIXML
+    # when using -NonInteractive -EncodedCommand, leaving stdout empty.
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "ad_groups_result.json")
+
     script = (
         "Import-Module ActiveDirectory; "
-        f"(Get-ADUser -Identity '{safe_sam}' -Properties MemberOf).MemberOf | "
-        "ConvertTo-Json -Compress"
+        f"$m = (Get-ADUser -Identity '{safe_sam}' -Properties MemberOf).MemberOf; "
+        f"if ($m) {{ $m | ConvertTo-Json -Compress | Set-Content -Path '{tmp}' -Encoding UTF8 }} "
+        f"else {{ Set-Content -Path '{tmp}' -Value '[]' -Encoding UTF8 }}"
     )
     success, stdout, stderr = run_powershell(script, timeout=30)
 
-    logger.info("AD groups lookup: success=%s, stdout_len=%d", success, len(stdout))
+    logger.info("AD groups lookup: success=%s", success)
 
-    if not stdout or stdout.strip() == "":
-        logger.info("User has no AD group memberships (MemberOf empty)")
+    # Read results from temp file
+    try:
+        with open(tmp, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        os.remove(tmp)
+    except (OSError, FileNotFoundError) as e:
+        logger.warning("Could not read AD groups temp file: %s", e)
+        return []
+
+    if not content or content == "[]":
+        logger.info("User has no AD group memberships")
         return []
 
     try:
-        data = json.loads(stdout)
+        data = json.loads(content)
         if isinstance(data, str):
             data = [data]
         logger.info("User AD groups found: %d", len(data))
         return data
     except json.JSONDecodeError:
-        logger.warning("Could not parse user AD groups: %s", stdout[:300])
+        logger.warning("Could not parse user AD groups: %s", content[:300])
         return []
 
 
