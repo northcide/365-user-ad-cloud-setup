@@ -458,15 +458,16 @@ def get_ad_groups() -> list:
         return []
 
 
-def get_user_ad_groups(user_dn: str) -> list:
+def get_user_ad_groups(sam_account_name: str) -> list:
     """
     Get the list of group DNs that a user is a member of.
+    Uses sAMAccountName for reliable lookup (no DN escaping issues).
     Returns a list of group DN strings.
     """
-    safe_dn = sanitize_for_powershell(user_dn)
+    safe_sam = sanitize_for_powershell(sam_account_name)
     script = f"""
     Import-Module ActiveDirectory
-    $user = Get-ADUser -Identity '{safe_dn}' -Properties MemberOf
+    $user = Get-ADUser -Identity '{safe_sam}' -Properties MemberOf
     $groups = @($user.MemberOf)
     if ($groups.Count -gt 0) {{
         $groups | ConvertTo-Json -Compress
@@ -2324,7 +2325,7 @@ class ProvisioningApp(tk.Tk):
                 UserPrincipalName -like $term
             }} -Properties DisplayName, Title, UserPrincipalName |
               Select-Object -First 20
-            $users | Select-Object @{{N='display_name';E={{$_.DisplayName}}}}, @{{N='dn';E={{$_.DistinguishedName}}}}, @{{N='title';E={{$_.Title}}}}, @{{N='upn';E={{$_.UserPrincipalName}}}} | ConvertTo-Json -Compress
+            $users | Select-Object @{{N='display_name';E={{$_.DisplayName}}}}, @{{N='dn';E={{$_.DistinguishedName}}}}, @{{N='sam';E={{$_.SamAccountName}}}}, @{{N='title';E={{$_.Title}}}}, @{{N='upn';E={{$_.UserPrincipalName}}}} | ConvertTo-Json -Compress
             """
             success, stdout, stderr = run_powershell(script, timeout=15)
             if not success:
@@ -2350,7 +2351,7 @@ class ProvisioningApp(tk.Tk):
                 label = f"{display} ({title})" if title else display
                 self._copy_user_matches.append((
                     display,
-                    u.get("dn", ""),
+                    u.get("sam", ""),
                     u.get("upn", ""),
                 ))
                 self.copy_user_results.insert("end", label)
@@ -2367,13 +2368,13 @@ class ProvisioningApp(tk.Tk):
         if idx >= len(self._copy_user_matches):
             return
 
-        display, user_dn, user_upn = self._copy_user_matches[idx]
+        display, user_sam, user_upn = self._copy_user_matches[idx]
         self.copy_user_results.pack_forget()
         self.copy_status_label.configure(text=f"Loading groups for {display}...",
                                           foreground="blue")
 
         def fetch_groups():
-            ad_group_dns = get_user_ad_groups(user_dn) if user_dn else []
+            ad_group_dns = get_user_ad_groups(user_sam) if user_sam else []
             cloud_group_ids = get_user_cloud_groups(user_upn) if user_upn else []
             return ad_group_dns, cloud_group_ids
 
