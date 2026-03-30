@@ -1276,7 +1276,7 @@ class SetupWizard(tk.Toplevel):
         instructions_frame.grid(row=4, column=0, sticky="ew", pady=(5, 0))
 
         instructions = scrolledtext.ScrolledText(
-            instructions_frame, wrap="word", font=("Consolas", 8),
+            instructions_frame, wrap="char", font=("Consolas", 8),
             height=12, bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="normal")
         instructions.pack(fill="both", expand=True)
 
@@ -1361,7 +1361,7 @@ class SetupWizard(tk.Toplevel):
             row=0, column=0, sticky="w", pady=(0, 8))
 
         self._review_text = scrolledtext.ScrolledText(
-            page, wrap="word", font=("Consolas", 9),
+            page, wrap="char", font=("Consolas", 9),
             height=16, bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="disabled")
         self._review_text.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         page.rowconfigure(1, weight=1)
@@ -2535,7 +2535,7 @@ REMEDIATION = {
     "powershell": {
         CHECK_FAIL: (
             "HOW TO FIX: PowerShell Not Available\n"
-            "\u2501" * 36 + "\n"
+            "=" * 36 + "\n"
             "This tool must run on a Windows machine with PowerShell.\n\n"
             "1. This EXE is designed to run on a Windows Domain Controller.\n"
             "2. If you're testing on a non-Windows machine, the tool won't work.\n"
@@ -2546,7 +2546,7 @@ REMEDIATION = {
     "ad_module": {
         CHECK_FAIL: (
             "HOW TO FIX: Active Directory PowerShell Module\n"
-            "\u2501" * 46 + "\n"
+            "=" * 46 + "\n"
             "The AD module is required to create users and query the domain.\n\n"
             "If running on a Domain Controller:\n"
             "  - The module should already be installed. Try:\n"
@@ -2564,7 +2564,7 @@ REMEDIATION = {
     "ad_permissions": {
         CHECK_FAIL: (
             "HOW TO FIX: AD Permissions\n"
-            "\u2501" * 26 + "\n"
+            "=" * 26 + "\n"
             "The current user cannot query Active Directory.\n\n"
             "1. Right-click the EXE and select 'Run as administrator'\n"
             "2. Ensure you are logged in as a Domain Admin, or an account with\n"
@@ -2581,7 +2581,7 @@ REMEDIATION = {
     "network": {
         CHECK_FAIL: (
             "HOW TO FIX: Network Connectivity\n"
-            "\u2501" * 32 + "\n"
+            "=" * 32 + "\n"
             "The DC must reach Microsoft cloud endpoints over HTTPS (port 443).\n\n"
             "Required endpoints:\n"
             "  - login.microsoftonline.com  (Entra ID authentication)\n"
@@ -2602,7 +2602,7 @@ REMEDIATION = {
     "certificate": {
         CHECK_FAIL: (
             "HOW TO FIX: Graph API Certificate\n"
-            "\u2501" * 33 + "\n"
+            "=" * 33 + "\n"
             "A certificate is needed so this tool can authenticate to Microsoft 365\n"
             "without storing a password. Each customer needs their own certificate.\n\n"
             "OPTION A \u2014 Generate Certificate (click 'Generate Cert' button below)\n"
@@ -2617,7 +2617,7 @@ REMEDIATION = {
         ),
         CHECK_WARN: (
             "WARNING: Certificate File Issue\n"
-            "\u2501" * 31 + "\n"
+            "=" * 31 + "\n"
             "The file exists but may not be a valid PEM certificate or\n"
             "DPAPI-encrypted file.\n\n"
             "Expected formats:\n"
@@ -2633,7 +2633,7 @@ REMEDIATION = {
     "graph_auth": {
         CHECK_FAIL: (
             "HOW TO FIX: Microsoft 365 Login\n"
-            "\u2501" * 31 + "\n"
+            "=" * 31 + "\n"
             "The tool could not authenticate to this customer's Microsoft 365 tenant.\n\n"
             "For each customer, you need an App Registration in THEIR Entra ID tenant.\n\n"
             "  Step 1: Create the App Registration\n"
@@ -2682,7 +2682,7 @@ REMEDIATION = {
     "graph_perms": {
         CHECK_FAIL: (
             "HOW TO FIX: Graph API Permissions\n"
-            "\u2501" * 33 + "\n"
+            "=" * 33 + "\n"
             "Authentication works, but the app is missing required permissions.\n\n"
             "1. Go to: portal.azure.com > Entra ID > App registrations\n"
             "2. Select the 'User Provisioning Tool' app\n"
@@ -2702,7 +2702,7 @@ REMEDIATION = {
         ),
         CHECK_WARN: (
             "WARNING: Partial Permissions\n"
-            "\u2501" * 28 + "\n"
+            "=" * 28 + "\n"
             "License management works, but cloud group management is not available.\n\n"
             "To enable cloud group assignment, add these permissions to the App Registration:\n"
             "  - Group.ReadWrite.All\n"
@@ -2714,7 +2714,7 @@ REMEDIATION = {
     "adsync": {
         CHECK_WARN: (
             "INFO: Entra Connect Sync Server\n"
-            "\u2501" * 31 + "\n"
+            "=" * 31 + "\n"
             "The tool couldn't automatically detect where Entra Connect is installed.\n"
             "This is common if the sync agent is on a member server (not a DC).\n\n"
             "You can still use the tool \u2014 in the main window you'll see options to:\n"
@@ -2734,7 +2734,7 @@ REMEDIATION = {
     "config": {
         CHECK_FAIL: (
             "HOW TO FIX: Configuration Not Found\n"
-            "\u2501" * 35 + "\n"
+            "=" * 35 + "\n"
             f"No config.json found at:\n  {CONFIG_PATH}\n\n"
             "This is expected on first run. Click 'Run Setup Wizard' below\n"
             "to create your configuration interactively.\n\n"
@@ -3050,7 +3050,7 @@ class PreflightDialog(tk.Tk):
         detail_frame.pack(fill="both", expand=True, padx=15, pady=(0, 5))
 
         self.detail_text = scrolledtext.ScrolledText(
-            detail_frame, wrap="word", font=("Consolas", 9),
+            detail_frame, wrap="char", font=("Consolas", 9),
             state="disabled", height=12, bg="#1e1e1e", fg="#d4d4d4",
             insertbackground="#d4d4d4", relief="flat",
         )
@@ -3094,7 +3094,7 @@ class PreflightDialog(tk.Tk):
         # Show welcome message in detail pane
         self._set_detail_text(
             "CUSTOMER SETUP CHECKLIST\n"
-            "\u2501" * 24 + "\n"
+            "=" * 24 + "\n"
             "For each new customer deployment, you need:\n\n"
             f"  1. Create config.json next to the EXE:\n"
             f"     {CONFIG_PATH}\n"
