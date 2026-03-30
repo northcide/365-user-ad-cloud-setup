@@ -237,6 +237,8 @@ def dpapi_decrypt_to_memory(protected_path: str) -> str:
     if not os.path.isfile(protected_path):
         raise RuntimeError(f"Protected file not found: {protected_path}")
 
+    # Decrypt and re-encode as base64 for safe transfer through stdout
+    # (run_powershell strips trailing whitespace which corrupts PEM content)
     script = f"""
     Add-Type -AssemblyName System.Security
     $b64 = Get-Content -Path '{protected_path}' -Raw
@@ -245,15 +247,20 @@ def dpapi_decrypt_to_memory(protected_path: str) -> str:
         $encBytes, $null,
         [System.Security.Cryptography.DataProtectionScope]::CurrentUser
     )
-    $text = [System.Text.Encoding]::UTF8.GetString($plainBytes)
-    Write-Output $text
+    $outB64 = [Convert]::ToBase64String($plainBytes)
+    Write-Output $outB64
     """
     success, stdout, stderr = run_powershell(script, timeout=15)
 
     if not success:
         raise RuntimeError(f"DPAPI decryption failed: {stderr[:300]}")
 
-    return stdout
+    # Decode the base64-wrapped plaintext back to the original string
+    try:
+        plain_bytes = base64.b64decode(stdout.strip())
+        return plain_bytes.decode("utf-8")
+    except Exception as e:
+        raise RuntimeError(f"Failed to decode decrypted content: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1079,22 +1086,19 @@ def generate_certificate_on_dc(cert_path: str = None) -> tuple:
     # Export public key as CER (for uploading to Azure)
     Export-Certificate -Cert $cert -FilePath '{cer_path}' -Force | Out-Null
 
-    # Export private key as PEM using .NET
-    # Get the RSA private key
+    # Export private key as PKCS8 PEM (required by MSAL Python)
     $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-    $privKeyBytes = $rsa.ExportRSAPrivateKey()
-    $privKeyPem = "-----BEGIN RSA PRIVATE KEY-----`r`n"
-    $privKeyPem += [Convert]::ToBase64String($privKeyBytes, 'InsertLineBreaks')
-    $privKeyPem += "`r`n-----END RSA PRIVATE KEY-----"
+    $privKeyBytes = $rsa.ExportPkcs8PrivateKey()
+    $privKeyB64 = [Convert]::ToBase64String($privKeyBytes, 'InsertLineBreaks')
+    $privKeyPem = "-----BEGIN PRIVATE KEY-----`n$privKeyB64`n-----END PRIVATE KEY-----"
 
     # Also include the certificate (public key) in the PEM for MSAL
     $certBytes = $cert.Export('Cert')
-    $certPem = "-----BEGIN CERTIFICATE-----`r`n"
-    $certPem += [Convert]::ToBase64String($certBytes, 'InsertLineBreaks')
-    $certPem += "`r`n-----END CERTIFICATE-----"
+    $certB64 = [Convert]::ToBase64String($certBytes, 'InsertLineBreaks')
+    $certPem = "-----BEGIN CERTIFICATE-----`n$certB64`n-----END CERTIFICATE-----"
 
-    $fullPem = $privKeyPem + "`r`n" + $certPem
-    Set-Content -Path '{pem_path}' -Value $fullPem -Encoding ASCII
+    $fullPem = $privKeyPem + "`n" + $certPem
+    [System.IO.File]::WriteAllText('{pem_path}', $fullPem, [System.Text.Encoding]::ASCII)
 
     # Output thumbprint and paths for the caller
     $result = @{{
