@@ -495,12 +495,14 @@ def search_ad_users(search_term: str) -> list:
 
     script = f"""
     Import-Module ActiveDirectory
-    Get-ADUser -Filter "Name -like '*{safe_term}*' -or DisplayName -like '*{safe_term}*' -or SamAccountName -like '*{safe_term}*'" -Properties DisplayName, Title |
+    $term = '*{safe_term}*'
+    $users = Get-ADUser -Filter {{
+        Name -like $term -or
+        DisplayName -like $term -or
+        SamAccountName -like $term
+    }} -Properties DisplayName, Title |
       Select-Object -First 20
-        @{{N='display_name';E={{$_.DisplayName}}}},
-        @{{N='dn';E={{$_.DistinguishedName}}}},
-        @{{N='title';E={{$_.Title}}}} |
-      ConvertTo-Json -Compress
+    $users | Select-Object @{{N='display_name';E={{$_.DisplayName}}}}, @{{N='dn';E={{$_.DistinguishedName}}}}, @{{N='title';E={{$_.Title}}}} | ConvertTo-Json -Compress
     """
     success, stdout, stderr = run_powershell(script, timeout=15)
     if not success:
@@ -2139,7 +2141,14 @@ class ProvisioningApp(tk.Tk):
             display_values.append(canonical)
         self.ou_combo["values"] = display_values
         if display_values:
-            self.ou_combo.current(0)
+            # Try to default to a "Users" OU, otherwise the domain root
+            default_idx = 0
+            for i, val in enumerate(display_values):
+                lower = val.lower()
+                if lower.endswith("/users") or "/users" in lower:
+                    default_idx = i
+                    break
+            self.ou_combo.current(default_idx)
 
     def _load_upn_suffixes(self):
         return get_ad_upn_suffixes()
@@ -2301,13 +2310,15 @@ class ProvisioningApp(tk.Tk):
             # Search across Name, DisplayName, SamAccountName, and UPN
             script = f"""
             Import-Module ActiveDirectory
-            Get-ADUser -Filter "Name -like '*{safe_term}*' -or DisplayName -like '*{safe_term}*' -or SamAccountName -like '*{safe_term}*' -or UserPrincipalName -like '*{safe_term}*'" -Properties DisplayName, Title, UserPrincipalName |
+            $term = '*{safe_term}*'
+            $users = Get-ADUser -Filter {{
+                Name -like $term -or
+                DisplayName -like $term -or
+                SamAccountName -like $term -or
+                UserPrincipalName -like $term
+            }} -Properties DisplayName, Title, UserPrincipalName |
               Select-Object -First 20
-                @{{N='display_name';E={{$_.DisplayName}}}},
-                @{{N='dn';E={{$_.DistinguishedName}}}},
-                @{{N='title';E={{$_.Title}}}},
-                @{{N='upn';E={{$_.UserPrincipalName}}}} |
-              ConvertTo-Json -Compress
+            $users | Select-Object @{{N='display_name';E={{$_.DisplayName}}}}, @{{N='dn';E={{$_.DistinguishedName}}}}, @{{N='title';E={{$_.Title}}}}, @{{N='upn';E={{$_.UserPrincipalName}}}} | ConvertTo-Json -Compress
             """
             success, stdout, stderr = run_powershell(script, timeout=15)
             if not success:
