@@ -1,0 +1,39 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "provision_user.py"
+      - "requirements.txt"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller --onefile --windowed --name "UserProvisioning" provision_user.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UserProvisioning
+          path: dist/UserProvisioning.exe
+
+      - name: Create release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/UserProvisioning.exe
