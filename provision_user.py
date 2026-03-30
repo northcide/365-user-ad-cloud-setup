@@ -467,23 +467,49 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     safe_sam = sanitize_for_powershell(sam_account_name)
     logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
 
-    # Use Get-ADPrincipalGroupMembership which is more reliable than
-    # the MemberOf property (includes all groups, primary group, etc.)
+    # Use Get-ADUser with MemberOf, plus a separate query for the
+    # primary group. Also try tokenGroups as a fallback which captures
+    # all direct and nested group memberships.
     script = f"""
     Import-Module ActiveDirectory
-    $groups = Get-ADPrincipalGroupMembership -Identity '{safe_sam}' |
-      Select-Object -Property DistinguishedName
-    $dns = @($groups | ForEach-Object {{ $_.DistinguishedName }})
-    if ($dns.Count -gt 0) {{
-        $dns | ConvertTo-Json -Compress
+    $user = Get-ADUser -Identity '{safe_sam}' -Properties MemberOf, PrimaryGroup
+    $allGroups = [System.Collections.ArrayList]@()
+
+    # Add MemberOf groups
+    if ($user.MemberOf) {{
+        foreach ($g in $user.MemberOf) {{
+            [void]$allGroups.Add($g)
+        }}
+    }}
+
+    # If MemberOf was empty, try tokenGroups attribute which always works
+    if ($allGroups.Count -eq 0) {{
+        $userDN = $user.DistinguishedName
+        $adEntry = [ADSI]"LDAP://$userDN"
+        $adEntry.RefreshCache("tokenGroups")
+        foreach ($sid in $adEntry.Properties["tokenGroups"]) {{
+            $secId = New-Object System.Security.Principal.SecurityIdentifier($sid, 0)
+            try {{
+                $group = Get-ADGroup -Identity $secId
+                [void]$allGroups.Add($group.DistinguishedName)
+            }} catch {{}}
+        }}
+    }}
+
+    # Add primary group if not already included
+    if ($user.PrimaryGroup -and ($allGroups -notcontains $user.PrimaryGroup)) {{
+        [void]$allGroups.Add($user.PrimaryGroup)
+    }}
+
+    if ($allGroups.Count -gt 0) {{
+        $allGroups | ConvertTo-Json -Compress
     }} else {{
         Write-Output '[]'
     }}
     """
-    success, stdout, stderr = run_powershell(script, timeout=30)
+    success, stdout, stderr = run_powershell(script, timeout=45)
 
-    # Strip any CLIXML progress noise from stdout (Write-Host, progress bars)
-    # The JSON should be the last line
+    # Extract JSON from output (skip any CLIXML progress lines)
     lines = stdout.strip().split("\n")
     json_line = ""
     for line in reversed(lines):
@@ -494,7 +520,7 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     if not json_line:
         json_line = stdout.strip()
 
-    logger.info("AD groups lookup result: success=%s, output=%s", success, json_line[:300])
+    logger.info("AD groups lookup result: success=%s, output=%s", success, json_line[:500])
 
     if not success:
         logger.warning("Failed to get user AD groups: %s", stderr[:300])
