@@ -467,36 +467,66 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     safe_sam = sanitize_for_powershell(sam_account_name)
     logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
 
-    # Use -Command instead of -EncodedCommand. The EncodedCommand approach
-    # on this DC silently swallows pipeline output into CLIXML stderr.
-    cmd = (
-        "(Get-ADUser -Identity '" + safe_sam + "' -Properties MemberOf).MemberOf | "
-        "ConvertTo-Json -Compress"
+    # Write a temporary .ps1 script file, execute it, read results from
+    # a temp output file. This is the most reliable approach — avoids all
+    # issues with -EncodedCommand, -Command, stdout capture, and CLIXML.
+    import tempfile
+    tmp_dir = tempfile.gettempdir()
+    ps1_path = os.path.join(tmp_dir, "get_user_groups.ps1")
+    out_path = os.path.join(tmp_dir, "user_groups_result.txt")
+
+    # Write the PS1 script
+    ps1_content = (
+        "Import-Module ActiveDirectory\n"
+        "$m = (Get-ADUser -Identity '" + safe_sam + "' -Properties MemberOf).MemberOf\n"
+        "if ($m) {\n"
+        "    $m | ConvertTo-Json -Compress | Out-File -FilePath '" + out_path + "' -Encoding ASCII -Force\n"
+        "} else {\n"
+        "    '[]' | Out-File -FilePath '" + out_path + "' -Encoding ASCII -Force\n"
+        "}\n"
     )
+    with open(ps1_path, "w", encoding="ascii") as f:
+        f.write(ps1_content)
+
+    # Remove old output file if it exists
+    try:
+        os.remove(out_path)
+    except OSError:
+        pass
+
     try:
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-Command", cmd],
+             "-File", ps1_path],
             capture_output=True, text=True, timeout=30
         )
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-        logger.info("AD groups lookup: rc=%d, stdout_len=%d, stderr_len=%d",
-                     result.returncode, len(stdout), len(stderr))
-        if stdout:
-            logger.info("AD groups stdout: %s", stdout[:300])
-        if stderr and not stdout:
-            logger.info("AD groups stderr (first 300): %s", stderr[:300])
+        logger.info("AD groups ps1 execution: rc=%d", result.returncode)
     except Exception as e:
         logger.warning("AD groups subprocess failed: %s", e)
         return []
+    finally:
+        try:
+            os.remove(ps1_path)
+        except OSError:
+            pass
 
-    if not stdout or stdout == "null":
+    # Read results
+    try:
+        with open(out_path, "r", encoding="utf-8-sig") as f:
+            content = f.read().strip()
+        os.remove(out_path)
+    except (OSError, FileNotFoundError) as e:
+        logger.warning("Could not read AD groups result file: %s", e)
+        return []
+
+    logger.info("AD groups file content (%d chars): %s", len(content), content[:500])
+
+    if not content or content == "null" or content == "[]":
         logger.info("User has no AD group memberships")
         return []
 
     try:
-        data = json.loads(stdout)
+        data = json.loads(content)
         if data is None:
             return []
         if isinstance(data, str):
@@ -504,7 +534,7 @@ def get_user_ad_groups(sam_account_name: str) -> list:
         logger.info("User AD groups found: %d", len(data))
         return data
     except json.JSONDecodeError:
-        logger.warning("Could not parse user AD groups: %s", repr(stdout[:300]))
+        logger.warning("Could not parse user AD groups: %s", repr(content[:300]))
         return []
 
 
