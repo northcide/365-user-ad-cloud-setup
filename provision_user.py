@@ -1780,6 +1780,276 @@ CHECK_PASS = "pass"
 CHECK_WARN = "warn"
 CHECK_FAIL = "fail"
 
+# ── Remediation instructions for each check ──────────────────────────────
+# These are shown in detail when a check fails or warns. Written for an MSP
+# tech deploying this tool to a new customer DC for the first time.
+
+REMEDIATION = {
+    "powershell": {
+        CHECK_FAIL: (
+            "HOW TO FIX: PowerShell Not Available\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "This tool must run on a Windows machine with PowerShell.\n\n"
+            "1. This EXE is designed to run on a Windows Domain Controller.\n"
+            "2. If you're testing on a non-Windows machine, the tool won't work.\n"
+            "3. Ensure powershell.exe is in your system PATH.\n"
+            "4. Try opening PowerShell manually to verify it launches."
+        ),
+    },
+    "ad_module": {
+        CHECK_FAIL: (
+            "HOW TO FIX: Active Directory PowerShell Module\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The AD module is required to create users and query the domain.\n\n"
+            "If running on a Domain Controller:\n"
+            "  - The module should already be installed. Try:\n"
+            "    Import-Module ActiveDirectory\n"
+            "  - If missing, open Server Manager > Add Roles and Features >\n"
+            "    Features > Remote Server Administration Tools >\n"
+            "    Role Administration Tools > AD DS and AD LDS Tools >\n"
+            "    Active Directory module for Windows PowerShell\n\n"
+            "If running on a workstation:\n"
+            "  - Install RSAT (Remote Server Administration Tools):\n"
+            "    Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0\n"
+            "  - Restart PowerShell after installing."
+        ),
+    },
+    "ad_permissions": {
+        CHECK_FAIL: (
+            "HOW TO FIX: AD Permissions\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The current user cannot query Active Directory.\n\n"
+            "1. Right-click the EXE and select 'Run as administrator'\n"
+            "2. Ensure you are logged in as a Domain Admin, or an account with\n"
+            "   delegated permissions to:\n"
+            "   - Create User objects in the target OUs\n"
+            "   - Modify group memberships\n"
+            "   - Read all OUs and security groups\n\n"
+            "3. To check your current user:\n"
+            "   whoami /groups | findstr 'Domain Admins'\n\n"
+            "4. If using delegated permissions, ensure the Delegation of Control\n"
+            "   wizard has granted Create/Delete User Objects on the target OUs."
+        ),
+    },
+    "network": {
+        CHECK_FAIL: (
+            "HOW TO FIX: Network Connectivity\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The DC must reach Microsoft cloud endpoints over HTTPS (port 443).\n\n"
+            "Required endpoints:\n"
+            "  - login.microsoftonline.com  (Entra ID authentication)\n"
+            "  - graph.microsoft.com        (Microsoft Graph API)\n\n"
+            "Troubleshooting:\n"
+            "1. Check firewall rules — port 443 outbound must be open to these hosts\n"
+            "2. Check proxy settings — if the DC uses a web proxy:\n"
+            "   netsh winhttp show proxy\n"
+            "3. Test manually:\n"
+            "   Test-NetConnection login.microsoftonline.com -Port 443\n"
+            "   Test-NetConnection graph.microsoft.com -Port 443\n"
+            "4. If using a proxy, set the system proxy:\n"
+            "   netsh winhttp set proxy proxy-server:port\n"
+            "5. DNS resolution — verify the DC can resolve these hostnames:\n"
+            "   Resolve-DnsName login.microsoftonline.com"
+        ),
+    },
+    "certificate": {
+        CHECK_FAIL: (
+            "HOW TO FIX: Graph API Certificate\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "A certificate is needed so this tool can authenticate to Microsoft 365\n"
+            "without storing a password. Each customer needs their own certificate.\n\n"
+            "OPTION A — Generate Certificate (click 'Generate Cert' button below)\n"
+            "  The button will create a self-signed certificate automatically and\n"
+            "  place it at the expected path. You'll still need to upload the public\n"
+            "  key to Azure (see Step 2).\n\n"
+            "OPTION B — Generate Manually in PowerShell (Run as Admin)\n"
+            "  Step 1: Create the certificate\n"
+            "  ──────────────────────────────\n"
+            f"  mkdir '{os.path.dirname(GRAPH_CERT_PATH)}' -Force\n"
+            "  $cert = New-SelfSignedCertificate `\n"
+            "    -Subject 'CN=UserProvisioningTool' `\n"
+            "    -CertStoreLocation 'Cert:\\CurrentUser\\My' `\n"
+            "    -KeyExportPolicy Exportable `\n"
+            "    -KeySpec Signature `\n"
+            "    -KeyLength 2048 `\n"
+            "    -NotAfter (Get-Date).AddYears(2)\n\n"
+            "  # Export private key as PEM (for this tool)\n"
+            "  $pem = [Convert]::ToBase64String($cert.Export('Pfx',''), 'InsertLineBreaks')\n"
+            "  # NOTE: Use the 'Generate Cert' button for proper PEM export.\n\n"
+            "  # Export public key as CER (for Azure upload)\n"
+            "  Export-Certificate -Cert $cert -FilePath C:\\Certs\\graph_app.cer\n\n"
+            "  # Note the thumbprint — you'll need it for the config:\n"
+            "  Write-Host 'Thumbprint:' $cert.Thumbprint\n\n"
+            "  Step 2: Upload to Azure App Registration\n"
+            "  ─────────────────────────────────────────\n"
+            "  1. Go to: portal.azure.com > Entra ID > App registrations\n"
+            "  2. Find (or create) the 'User Provisioning Tool' app\n"
+            "  3. Go to: Certificates & secrets > Certificates > Upload certificate\n"
+            "  4. Upload the .cer file from C:\\Certs\\graph_app.cer\n"
+            "  5. Copy the thumbprint shown after upload\n\n"
+            "  Step 3: Update this tool's config\n"
+            "  ─────────────────────────────────\n"
+            f"  Edit the constants at the top of the script:\n"
+            f"  GRAPH_CERT_THUMBPRINT = '<thumbprint from step above>'\n"
+            f"  GRAPH_CERT_PATH = r'{GRAPH_CERT_PATH}'\n\n"
+            "  Then click 'Retry' to re-run checks."
+        ),
+        CHECK_WARN: (
+            "WARNING: Certificate File Issue\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The file exists but may not be a valid PEM certificate.\n\n"
+            "A valid PEM file should start with:\n"
+            "  -----BEGIN PRIVATE KEY-----\n"
+            "  or\n"
+            "  -----BEGIN RSA PRIVATE KEY-----\n\n"
+            "If the file is in PFX/PKCS12 format, convert it:\n"
+            "  openssl pkcs12 -in cert.pfx -out graph_app.pem -nodes\n\n"
+            "Or use the 'Generate Cert' button to create a new valid PEM."
+        ),
+    },
+    "graph_auth": {
+        CHECK_FAIL: (
+            "HOW TO FIX: Microsoft 365 Login\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The tool could not authenticate to this customer's Microsoft 365 tenant.\n\n"
+            "For each customer, you need an App Registration in THEIR Entra ID tenant.\n\n"
+            "  Step 1: Create the App Registration\n"
+            "  ────────────────────────────────────\n"
+            "  1. Sign in to portal.azure.com as a Global Admin for the customer\n"
+            "  2. Go to: Entra ID > App registrations > New registration\n"
+            "  3. Name: 'User Provisioning Tool'\n"
+            "  4. Supported account types: 'Accounts in this organizational directory only'\n"
+            "  5. Click Register\n"
+            "  6. On the overview page, copy:\n"
+            "     - Application (client) ID  ->  GRAPH_CLIENT_ID in the config\n"
+            "     - Directory (tenant) ID    ->  GRAPH_TENANT_ID in the config\n\n"
+            "  Step 2: Upload the Certificate\n"
+            "  ──────────────────────────────\n"
+            "  1. In the App Registration, go to: Certificates & secrets\n"
+            "  2. Click 'Upload certificate'\n"
+            "  3. Upload the .cer public key file (from the certificate step)\n"
+            "  4. Copy the thumbprint shown -> GRAPH_CERT_THUMBPRINT in the config\n\n"
+            "  Step 3: Grant API Permissions\n"
+            "  ─────────────────────────────\n"
+            "  1. In the App Registration, go to: API permissions\n"
+            "  2. Click 'Add a permission' > Microsoft Graph > Application permissions\n"
+            "  3. Add these permissions:\n"
+            "     - User.ReadWrite.All\n"
+            "     - Directory.ReadWrite.All\n"
+            "     - Organization.Read.All\n"
+            "     - Group.ReadWrite.All\n"
+            "     - GroupMember.ReadWrite.All\n"
+            "  4. Click 'Grant admin consent for <tenant name>'\n"
+            "     (requires Global Admin — the green checkmarks must appear)\n\n"
+            "  Step 4: Update Config Constants\n"
+            "  ───────────────────────────────\n"
+            "  Edit the script's configuration section with the customer's values:\n"
+            f"    GRAPH_TENANT_ID = '<Directory (tenant) ID>'\n"
+            f"    GRAPH_CLIENT_ID = '<Application (client) ID>'\n"
+            f"    GRAPH_CERT_THUMBPRINT = '<certificate thumbprint>'\n"
+            f"    GRAPH_CERT_PATH = r'{GRAPH_CERT_PATH}'\n\n"
+            "  Then click 'Retry' to re-run checks.\n\n"
+            "COMMON ERRORS:\n"
+            "  - AADSTS700016: App not found — wrong Client ID or Tenant ID\n"
+            "  - AADSTS700027: Certificate mismatch — wrong thumbprint or cert not uploaded\n"
+            "  - AADSTS7000215: Invalid client secret — using secret instead of cert\n"
+            "  - AADSTS50034: User account doesn't exist — wrong tenant"
+        ),
+    },
+    "graph_perms": {
+        CHECK_FAIL: (
+            "HOW TO FIX: Graph API Permissions\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Authentication works, but the app is missing required permissions.\n\n"
+            "1. Go to: portal.azure.com > Entra ID > App registrations\n"
+            "2. Select the 'User Provisioning Tool' app\n"
+            "3. Go to: API permissions\n"
+            "4. Verify these Application permissions are listed AND have green checkmarks:\n"
+            "   - User.ReadWrite.All\n"
+            "   - Directory.ReadWrite.All\n"
+            "   - Organization.Read.All      (needed for license/SKU queries)\n"
+            "   - Group.ReadWrite.All         (needed for cloud group management)\n"
+            "   - GroupMember.ReadWrite.All   (needed to add users to cloud groups)\n\n"
+            "5. If any are missing, click 'Add a permission' > Microsoft Graph >\n"
+            "   Application permissions > search for and add them\n"
+            "6. IMPORTANT: Click 'Grant admin consent for <tenant name>'\n"
+            "   The status must show green checkmarks, not orange warnings.\n"
+            "   This requires Global Admin permissions.\n\n"
+            "Then click 'Retry' to re-check."
+        ),
+        CHECK_WARN: (
+            "WARNING: Partial Permissions\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "License management works, but cloud group management is not available.\n\n"
+            "To enable cloud group assignment, add these permissions to the App Registration:\n"
+            "  - Group.ReadWrite.All\n"
+            "  - GroupMember.ReadWrite.All\n\n"
+            "Then grant admin consent and click 'Retry'.\n\n"
+            "You can continue without this — on-prem AD groups and licensing will still work."
+        ),
+    },
+    "adsync": {
+        CHECK_WARN: (
+            "INFO: Entra Connect Sync Server\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The tool couldn't automatically detect where Entra Connect is installed.\n"
+            "This is common if the sync agent is on a member server (not a DC).\n\n"
+            "You can still use the tool — in the main window you'll see options to:\n"
+            "  - Enter the sync server hostname manually\n"
+            "  - Skip sync entirely (and trigger it yourself)\n\n"
+            "To find the Entra Connect server:\n"
+            "  1. Check Azure Portal > Entra ID > Entra Connect > Connect Sync\n"
+            "     The server name is shown under 'Sync server'\n"
+            "  2. Or run on each candidate server:\n"
+            "     Get-Service ADSync\n\n"
+            "If the customer uses Entra Cloud Sync instead of Entra Connect:\n"
+            "  - Cloud Sync doesn't have a Start-ADSyncSyncCycle command\n"
+            "  - Select 'Skip sync' in the main window — cloud sync runs automatically\n"
+            "    and the tool will poll until the user appears in Entra ID."
+        ),
+    },
+    "config": {
+        CHECK_FAIL: (
+            "HOW TO FIX: Configuration Not Customized\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The script still has placeholder values that need to be set for this customer.\n\n"
+            "Edit the configuration constants at the top of the script:\n\n"
+            "  1. DOMAIN SETTINGS\n"
+            "     AD_DOMAIN = 'customer.com'          # Their AD domain FQDN\n"
+            "     AD_NETBIOS = 'CUSTOMER'              # Their NetBIOS name\n"
+            "     EMAIL_DOMAINS = ['customer.com']     # Email domain(s)\n\n"
+            "  2. MICROSOFT 365 / ENTRA ID\n"
+            "     GRAPH_TENANT_ID = '<tenant-id>'      # From App Registration overview\n"
+            "     GRAPH_CLIENT_ID = '<client-id>'      # From App Registration overview\n"
+            "     GRAPH_CERT_THUMBPRINT = '<thumbprint>'# From certificate upload\n"
+            f"     GRAPH_CERT_PATH = r'{GRAPH_CERT_PATH}'  # Path to private key PEM\n\n"
+            "  HOW TO FIND THESE VALUES:\n"
+            "  - portal.azure.com > Entra ID > App registrations > your app > Overview\n"
+            "  - Tenant ID = 'Directory (tenant) ID'\n"
+            "  - Client ID = 'Application (client) ID'\n"
+            "  - Thumbprint = Certificates & secrets > Certificates > Thumbprint column"
+        ),
+    },
+}
+
+
+def _preflight_check_config() -> tuple:
+    """Verify the configuration constants have been customized for this customer."""
+    issues = []
+
+    if GRAPH_TENANT_ID.startswith("xxxx") or GRAPH_TENANT_ID == "":
+        issues.append("GRAPH_TENANT_ID is not set")
+    if GRAPH_CLIENT_ID.startswith("xxxx") or GRAPH_CLIENT_ID == "":
+        issues.append("GRAPH_CLIENT_ID is not set")
+    if GRAPH_CERT_THUMBPRINT.startswith("AABB") or GRAPH_CERT_THUMBPRINT == "":
+        issues.append("GRAPH_CERT_THUMBPRINT is not set")
+    if AD_DOMAIN == "contoso.com":
+        issues.append("AD_DOMAIN is still set to 'contoso.com'")
+
+    if issues:
+        return CHECK_FAIL, "Config not customized: " + "; ".join(issues)
+    return CHECK_PASS, f"Configuration set for {AD_DOMAIN}"
+
 
 def _preflight_check_powershell() -> tuple:
     """Verify powershell.exe is available."""
@@ -1801,7 +2071,7 @@ def _preflight_check_ad_module() -> tuple:
         domain = stdout.split("DOMAIN:")[1].strip()
         return CHECK_PASS, f"AD module loaded — domain: {domain}"
     if "not recognized" in stderr.lower() or "not installed" in stderr.lower():
-        return CHECK_FAIL, "ActiveDirectory module not installed. Install RSAT or run on a DC."
+        return CHECK_FAIL, "ActiveDirectory module not installed"
     return CHECK_FAIL, f"AD module error: {stderr[:150]}"
 
 
@@ -1817,7 +2087,7 @@ def _preflight_check_ad_permissions() -> tuple:
         count = stdout.split("OUS:")[1].strip()
         return CHECK_PASS, f"AD read access confirmed — {count} OUs found"
     if "access" in stderr.lower() or "denied" in stderr.lower():
-        return CHECK_FAIL, "Insufficient AD permissions. Run as a Domain Admin."
+        return CHECK_FAIL, "Insufficient AD permissions"
     return CHECK_WARN, f"Could not verify AD permissions: {stderr[:150]}"
 
 
@@ -1839,17 +2109,14 @@ def _preflight_check_network() -> tuple:
     if all_ok:
         return CHECK_PASS, "Network connectivity to Microsoft endpoints confirmed"
 
-    failed = [f"{label}: {err}" for label, ok, err in results if not ok]
-    return CHECK_FAIL, "Network unreachable: " + "; ".join(failed)
+    failed = [f"{label}" for label, ok, err in results if not ok]
+    return CHECK_FAIL, "Unreachable: " + ", ".join(failed)
 
 
 def _preflight_check_certificate() -> tuple:
     """Verify the Graph API certificate file exists and is readable."""
     if not os.path.isfile(GRAPH_CERT_PATH):
-        return CHECK_FAIL, (
-            f"Certificate not found at {GRAPH_CERT_PATH}\n"
-            "Create an App Registration certificate and place the PEM file there."
-        )
+        return CHECK_FAIL, f"Certificate not found at {GRAPH_CERT_PATH}"
 
     try:
         with open(GRAPH_CERT_PATH, "r") as f:
@@ -1870,12 +2137,13 @@ def _preflight_check_graph_auth() -> tuple:
         return CHECK_FAIL, "Token acquisition returned empty"
     except RuntimeError as e:
         msg = str(e)
-        if "Certificate not found" in msg:
-            return CHECK_FAIL, msg
+        if "AADSTS700016" in msg:
+            return CHECK_FAIL, "App not found — wrong Client ID or Tenant ID"
+        if "AADSTS700027" in msg:
+            return CHECK_FAIL, "Certificate mismatch — wrong thumbprint or cert not uploaded"
         if "AADSTS" in msg:
-            # Azure AD error codes — extract the useful part
-            return CHECK_FAIL, f"Entra ID auth error: {msg[:200]}"
-        return CHECK_FAIL, f"Graph auth failed: {msg[:200]}"
+            return CHECK_FAIL, f"Entra ID error: {msg[:150]}"
+        return CHECK_FAIL, f"Graph auth failed: {msg[:150]}"
     except Exception as e:
         return CHECK_FAIL, f"Graph auth error: {e}"
 
@@ -1885,23 +2153,21 @@ def _preflight_check_graph_permissions() -> tuple:
     try:
         headers = _graph_headers()
 
-        # Test 1: Can we read subscribed SKUs? (requires Organization.Read.All)
         resp = requests.get(
             "https://graph.microsoft.com/v1.0/subscribedSkus",
             headers=headers, timeout=15,
         )
         if resp.status_code == 403:
-            return CHECK_FAIL, "Missing permission: Organization.Read.All (cannot read licenses)"
+            return CHECK_FAIL, "Missing permission: Organization.Read.All"
         if resp.status_code == 401:
-            return CHECK_FAIL, "Authentication rejected — check App Registration config"
+            return CHECK_FAIL, "Authentication rejected"
 
-        # Test 2: Can we read groups? (requires Group.ReadWrite.All)
         resp2 = requests.get(
             "https://graph.microsoft.com/v1.0/groups?$top=1",
             headers=headers, timeout=15,
         )
         if resp2.status_code == 403:
-            return CHECK_WARN, "Licenses OK, but missing Group.ReadWrite.All (cloud groups won't work)"
+            return CHECK_WARN, "Licenses OK, but cloud groups unavailable (missing Group permissions)"
 
         return CHECK_PASS, "Graph API permissions verified (licenses + groups)"
     except requests.RequestException as e:
@@ -1913,21 +2179,106 @@ def _preflight_check_adsync() -> tuple:
     server, method = detect_sync_server()
     if server:
         return CHECK_PASS, f"Entra Connect found: {server} (detected via {method})"
-    return CHECK_WARN, (
-        "Entra Connect server not detected. You can enter it manually in the GUI "
-        "or skip sync and trigger it yourself."
-    )
+    return CHECK_WARN, "Not detected — enter manually in the main window or skip sync"
+
+
+def generate_certificate_on_dc() -> tuple:
+    """
+    Generate a self-signed certificate on the DC for Graph API authentication.
+    Exports private key as PEM and public key as CER.
+
+    Returns:
+        (success: bool, thumbprint: str, message: str)
+    """
+    cert_dir = os.path.dirname(GRAPH_CERT_PATH)
+    cer_path = GRAPH_CERT_PATH.replace(".pem", ".cer")
+
+    script = f"""
+    # Create certificate directory
+    New-Item -ItemType Directory -Force -Path '{cert_dir}' | Out-Null
+
+    # Generate self-signed certificate (2-year expiry)
+    $cert = New-SelfSignedCertificate `
+      -Subject 'CN=UserProvisioningTool' `
+      -FriendlyName 'User Provisioning Tool - Graph API' `
+      -CertStoreLocation 'Cert:\\CurrentUser\\My' `
+      -KeyExportPolicy Exportable `
+      -KeySpec Signature `
+      -KeyLength 2048 `
+      -KeyAlgorithm RSA `
+      -HashAlgorithm SHA256 `
+      -NotAfter (Get-Date).AddYears(2)
+
+    # Export public key as CER (for uploading to Azure)
+    Export-Certificate -Cert $cert -FilePath '{cer_path}' -Force | Out-Null
+
+    # Export private key as PEM using .NET
+    # Get the RSA private key
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $privKeyBytes = $rsa.ExportRSAPrivateKey()
+    $privKeyPem = "-----BEGIN RSA PRIVATE KEY-----`r`n"
+    $privKeyPem += [Convert]::ToBase64String($privKeyBytes, 'InsertLineBreaks')
+    $privKeyPem += "`r`n-----END RSA PRIVATE KEY-----"
+
+    # Also include the certificate (public key) in the PEM for MSAL
+    $certBytes = $cert.Export('Cert')
+    $certPem = "-----BEGIN CERTIFICATE-----`r`n"
+    $certPem += [Convert]::ToBase64String($certBytes, 'InsertLineBreaks')
+    $certPem += "`r`n-----END CERTIFICATE-----"
+
+    $fullPem = $privKeyPem + "`r`n" + $certPem
+    Set-Content -Path '{GRAPH_CERT_PATH}' -Value $fullPem -Encoding ASCII
+
+    # Output thumbprint and paths for the caller
+    $result = @{{
+      thumbprint = $cert.Thumbprint
+      pem_path = '{GRAPH_CERT_PATH}'
+      cer_path = '{cer_path}'
+      expiry = $cert.NotAfter.ToString('yyyy-MM-dd')
+      subject = $cert.Subject
+    }}
+    $result | ConvertTo-Json -Compress
+    """
+
+    logger.info("Generating self-signed certificate for Graph API...")
+    success, stdout, stderr = run_powershell(script, timeout=30)
+
+    if not success:
+        logger.error("Certificate generation failed: %s", stderr)
+        return False, "", f"Failed to generate certificate: {stderr[:300]}"
+
+    try:
+        data = json.loads(stdout)
+        thumbprint = data.get("thumbprint", "")
+        logger.info("Certificate generated — thumbprint: %s", thumbprint)
+        return True, thumbprint, (
+            f"Certificate generated successfully!\n\n"
+            f"  Thumbprint:  {thumbprint}\n"
+            f"  Private key: {data.get('pem_path', GRAPH_CERT_PATH)}\n"
+            f"  Public key:  {data.get('cer_path', cer_path)}\n"
+            f"  Expires:     {data.get('expiry', 'unknown')}\n\n"
+            f"NEXT STEPS:\n"
+            f"  1. Upload {cer_path} to your App Registration:\n"
+            f"     portal.azure.com > Entra ID > App registrations >\n"
+            f"     your app > Certificates & secrets > Upload certificate\n\n"
+            f"  2. Update the config in the script:\n"
+            f"     GRAPH_CERT_THUMBPRINT = '{thumbprint}'\n\n"
+            f"  3. Click 'Retry' to re-run preflight checks."
+        )
+    except json.JSONDecodeError:
+        return False, "", f"Certificate may have been created but could not parse output: {stdout[:200]}"
 
 
 # Ordered list of preflight checks: (name, display_label, check_function, is_required)
 PREFLIGHT_CHECKS = [
+    ("config",         "Configuration",               _preflight_check_config,          True),
     ("powershell",     "PowerShell",                  _preflight_check_powershell,      True),
     ("ad_module",      "AD PowerShell Module",        _preflight_check_ad_module,       True),
     ("ad_permissions", "AD Permissions",              _preflight_check_ad_permissions,  True),
     ("network",        "Network Connectivity",        _preflight_check_network,         True),
     ("certificate",    "Graph API Certificate",       _preflight_check_certificate,     True),
     ("graph_auth",     "Microsoft 365 Login",         _preflight_check_graph_auth,      True),
-    ("graph_perms",    "Graph API Permissions",        _preflight_check_graph_permissions, False),
+    ("graph_perms",    "Graph API Permissions",       _preflight_check_graph_permissions, False),
     ("adsync",         "Entra Connect Sync Server",   _preflight_check_adsync,          False),
 ]
 
@@ -1936,8 +2287,9 @@ class PreflightDialog(tk.Tk):
     """
     Startup dialog that runs environment checks before launching the main app.
 
-    Shows a checklist with real-time status indicators. Required checks must pass
-    to proceed; warnings allow continuing with reduced functionality.
+    Shows a checklist with real-time status. Clicking any failed/warning check
+    shows detailed step-by-step remediation instructions specific to that issue.
+    Required checks must pass to proceed.
     """
 
     ICON = {
@@ -1958,8 +2310,8 @@ class PreflightDialog(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Preflight Check — 365 User Provisioning")
-        self.geometry("620x480")
-        self.resizable(False, False)
+        self.geometry("820x700")
+        self.resizable(True, True)
 
         self._checks_passed = False
         self._check_rows = {}   # name -> (icon_label, text_label, detail_label)
@@ -1972,57 +2324,147 @@ class PreflightDialog(tk.Tk):
         # Header
         header = ttk.Label(self, text="Preflight Environment Check",
                            font=("Segoe UI", 14, "bold"))
-        header.pack(pady=(15, 5))
-        ttk.Label(self, text="Verifying requirements before launch...",
+        header.pack(pady=(15, 2))
+        ttk.Label(self, text="Verifying requirements before launch. "
+                  "Click any failed check for setup instructions.",
                   foreground="gray").pack(pady=(0, 10))
 
-        # Checklist frame
-        checklist = ttk.Frame(self, padding=10)
-        checklist.pack(fill="both", expand=True, padx=20)
+        # Top pane: checklist
+        top_frame = ttk.Frame(self, padding=10)
+        top_frame.pack(fill="x", padx=15)
 
         for i, (name, label, _func, required) in enumerate(PREFLIGHT_CHECKS):
-            icon_lbl = ttk.Label(checklist, text=self.ICON[CHECK_PENDING],
+            row_frame = ttk.Frame(top_frame)
+            row_frame.grid(row=i, column=0, columnspan=3, sticky="ew", pady=1)
+            row_frame.columnconfigure(2, weight=1)
+
+            icon_lbl = ttk.Label(row_frame, text=self.ICON[CHECK_PENDING],
                                   foreground=self.COLOR[CHECK_PENDING],
                                   font=("Segoe UI", 12))
-            icon_lbl.grid(row=i, column=0, padx=(0, 8), pady=3, sticky="w")
+            icon_lbl.grid(row=0, column=0, padx=(0, 8), sticky="w")
 
             req_tag = " *" if required else ""
-            text_lbl = ttk.Label(checklist, text=f"{label}{req_tag}",
-                                  font=("Segoe UI", 10))
-            text_lbl.grid(row=i, column=1, pady=3, sticky="w")
+            text_lbl = ttk.Label(row_frame, text=f"{label}{req_tag}",
+                                  font=("Segoe UI", 10), cursor="hand2")
+            text_lbl.grid(row=0, column=1, sticky="w")
 
-            detail_lbl = ttk.Label(checklist, text="", foreground="gray",
-                                    font=("Segoe UI", 9), wraplength=350)
-            detail_lbl.grid(row=i, column=2, padx=(15, 0), pady=3, sticky="w")
+            detail_lbl = ttk.Label(row_frame, text="", foreground="gray",
+                                    font=("Segoe UI", 9), wraplength=420)
+            detail_lbl.grid(row=0, column=2, padx=(15, 0), sticky="w")
+
+            # Click handler — show remediation for this check
+            for widget in (row_frame, icon_lbl, text_lbl, detail_lbl):
+                widget.bind("<Button-1>", lambda e, n=name: self._show_remediation(n))
+                widget.configure(cursor="hand2")
 
             self._check_rows[name] = (icon_lbl, text_lbl, detail_lbl)
 
         # Legend
-        ttk.Label(checklist, text="* = required",
+        ttk.Label(top_frame, text="* = required  |  Click any check for details",
                   foreground="gray", font=("Segoe UI", 8)).grid(
-            row=len(PREFLIGHT_CHECKS), column=0, columnspan=3, sticky="w", pady=(10, 0))
+            row=len(PREFLIGHT_CHECKS), column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         # Progress bar
         self.progress = ttk.Progressbar(self, maximum=len(PREFLIGHT_CHECKS), mode="determinate")
-        self.progress.pack(fill="x", padx=20, pady=(5, 10))
+        self.progress.pack(fill="x", padx=15, pady=(5, 5))
 
-        # Buttons
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(pady=(0, 15))
+        # Status summary
+        self.summary_label = ttk.Label(self, text="", font=("Segoe UI", 10, "bold"))
+        self.summary_label.pack(pady=(0, 5))
+
+        # ── Detail pane (remediation instructions) ───────────────────────
+        detail_frame = ttk.LabelFrame(self, text=" Setup Instructions ", padding=8)
+        detail_frame.pack(fill="both", expand=True, padx=15, pady=(0, 5))
+
+        self.detail_text = scrolledtext.ScrolledText(
+            detail_frame, wrap="word", font=("Consolas", 9),
+            state="disabled", height=12, bg="#1e1e1e", fg="#d4d4d4",
+            insertbackground="#d4d4d4", relief="flat",
+        )
+        self.detail_text.pack(fill="both", expand=True)
+
+        # Action buttons for the detail pane
+        self.detail_btn_frame = ttk.Frame(detail_frame)
+        self.detail_btn_frame.pack(fill="x", pady=(5, 0))
+
+        self.gen_cert_btn = ttk.Button(
+            self.detail_btn_frame, text="Generate Certificate",
+            command=self._on_generate_cert)
+        # Hidden by default — shown only when certificate check fails
+        self.gen_cert_btn.pack_forget()
+
+        self.copy_btn = ttk.Button(
+            self.detail_btn_frame, text="Copy to Clipboard",
+            command=self._copy_detail_to_clipboard)
+        self.copy_btn.pack(side="right")
+
+        # ── Main buttons ─────────────────────────────────────────────────
+        btn_frame = ttk.Frame(self, padding=(15, 5))
+        btn_frame.pack(fill="x")
 
         self.continue_btn = ttk.Button(btn_frame, text="Continue", state="disabled",
                                         command=self._on_continue)
         self.continue_btn.pack(side="left", padx=5)
 
-        self.retry_btn = ttk.Button(btn_frame, text="Retry", state="disabled",
+        self.retry_btn = ttk.Button(btn_frame, text="Retry All Checks", state="disabled",
                                      command=self._on_retry)
         self.retry_btn.pack(side="left", padx=5)
 
-        ttk.Button(btn_frame, text="Quit", command=self._on_quit).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Quit", command=self._on_quit).pack(side="right", padx=5)
 
-        # Status summary
-        self.summary_label = ttk.Label(self, text="", font=("Segoe UI", 10))
-        self.summary_label.pack(pady=(0, 10))
+        # Show welcome message in detail pane
+        self._set_detail_text(
+            "CUSTOMER SETUP CHECKLIST\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "For each new customer deployment, you need:\n\n"
+            "  1. Edit the script's configuration constants:\n"
+            "     - AD_DOMAIN, AD_NETBIOS, EMAIL_DOMAINS\n"
+            "     - GRAPH_TENANT_ID, GRAPH_CLIENT_ID\n"
+            "     - GRAPH_CERT_THUMBPRINT, GRAPH_CERT_PATH\n\n"
+            "  2. Create an App Registration in the customer's Entra ID tenant\n"
+            "     (portal.azure.com > Entra ID > App registrations)\n\n"
+            "  3. Generate a certificate and upload the public key to the App Registration\n"
+            "     (use the 'Generate Certificate' button when that check fails)\n\n"
+            "  4. Grant API permissions and admin consent on the App Registration\n\n"
+            "  5. Place the EXE + PEM certificate on the customer's DC\n\n"
+            "Checks are running now. Click any failed check for detailed instructions."
+        )
+
+    def _set_detail_text(self, text: str, show_cert_btn: bool = False):
+        """Update the detail/remediation text pane."""
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", text)
+        self.detail_text.configure(state="disabled")
+        self.detail_text.see("1.0")
+
+        if show_cert_btn:
+            self.gen_cert_btn.pack(side="left", padx=(0, 10))
+        else:
+            self.gen_cert_btn.pack_forget()
+
+    def _show_remediation(self, check_name: str):
+        """Show detailed remediation instructions for a specific check."""
+        status, message = self._results.get(check_name, (CHECK_PENDING, ""))
+
+        if status == CHECK_PASS:
+            self._set_detail_text(f"PASSED: {message}\n\nNo action needed.")
+            return
+
+        # Look up remediation instructions
+        check_remediation = REMEDIATION.get(check_name, {})
+        instructions = check_remediation.get(status)
+
+        if instructions:
+            show_cert = (check_name == "certificate" and status == CHECK_FAIL)
+            self._set_detail_text(instructions, show_cert_btn=show_cert)
+        else:
+            self._set_detail_text(
+                f"Status: {status.upper()}\n"
+                f"Detail: {message}\n\n"
+                "No specific remediation steps available for this issue.\n"
+                "Check the log file for more details."
+            )
 
     def _update_check(self, name: str, status: str, detail: str = ""):
         """Update a check row's icon, color, and detail text."""
@@ -2056,6 +2498,16 @@ class PreflightDialog(tk.Tk):
                 self.after(0, self._update_check, name, status, message)
                 self.after(0, self._advance_progress, i + 1)
 
+                # If a required check fails, skip dependent checks to save time
+                if status == CHECK_FAIL and required:
+                    # Mark remaining checks as pending and stop
+                    for j in range(i + 1, len(PREFLIGHT_CHECKS)):
+                        remaining_name = PREFLIGHT_CHECKS[j][0]
+                        self.after(0, self._update_check, remaining_name,
+                                   CHECK_PENDING, "Skipped — fix above issue first")
+                    self.after(0, self._advance_progress, len(PREFLIGHT_CHECKS))
+                    break
+
             self.after(0, self._checks_complete)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2064,14 +2516,17 @@ class PreflightDialog(tk.Tk):
         self.progress["value"] = value
 
     def _checks_complete(self):
-        """Evaluate results and enable/disable buttons."""
+        """Evaluate results, enable/disable buttons, and auto-show first failure."""
         required_failed = []
         warnings = []
+        first_fail_name = None
 
         for name, label, _func, required in PREFLIGHT_CHECKS:
-            status, message = self._results.get(name, (CHECK_FAIL, "Did not run"))
+            status, message = self._results.get(name, (CHECK_PENDING, ""))
             if status == CHECK_FAIL and required:
                 required_failed.append(label)
+                if first_fail_name is None:
+                    first_fail_name = name
             elif status == CHECK_WARN:
                 warnings.append(label)
 
@@ -2081,8 +2536,11 @@ class PreflightDialog(tk.Tk):
             self._checks_passed = False
             self.continue_btn.configure(state="disabled")
             self.summary_label.configure(
-                text=f"BLOCKED: {len(required_failed)} required check(s) failed",
+                text=f"BLOCKED: {len(required_failed)} required check(s) failed — see instructions below",
                 foreground="red")
+            # Auto-show remediation for the first failure
+            if first_fail_name:
+                self._show_remediation(first_fail_name)
         elif warnings:
             self._checks_passed = True
             self.continue_btn.configure(state="normal")
@@ -2096,16 +2554,56 @@ class PreflightDialog(tk.Tk):
                 text="ALL CHECKS PASSED — ready to launch",
                 foreground="green")
 
+    def _on_generate_cert(self):
+        """Generate a certificate for Graph API auth."""
+        self.gen_cert_btn.configure(state="disabled", text="Generating...")
+
+        def do_generate():
+            return generate_certificate_on_dc()
+
+        def on_done(result):
+            success, thumbprint, message = result
+            self.gen_cert_btn.configure(state="normal", text="Generate Certificate")
+            self._set_detail_text(message, show_cert_btn=not success)
+
+            if success:
+                messagebox.showinfo("Certificate Generated",
+                                     f"Certificate created successfully!\n\n"
+                                     f"Thumbprint: {thumbprint}\n\n"
+                                     "See the instructions panel for next steps.")
+
+        def on_error(e):
+            self.gen_cert_btn.configure(state="normal", text="Generate Certificate")
+            self._set_detail_text(f"Certificate generation failed:\n{e}")
+
+        # Run in thread to avoid blocking UI
+        def wrapper():
+            try:
+                result = do_generate()
+                self.after(0, on_done, result)
+            except Exception as e:
+                self.after(0, on_error, e)
+
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _copy_detail_to_clipboard(self):
+        """Copy the current detail text to clipboard."""
+        self.clipboard_clear()
+        text = self.detail_text.get("1.0", "end").strip()
+        self.clipboard_append(text)
+        self.copy_btn.configure(text="Copied!")
+        self.after(2000, lambda: self.copy_btn.configure(text="Copy to Clipboard"))
+
     def _on_continue(self):
         """Close preflight and signal to launch the main app."""
         self.destroy()
 
     def _on_retry(self):
         """Re-run all checks."""
-        # Clear Graph token cache so auth is re-tested
         _graph_token_cache["token"] = None
         _graph_token_cache["expires_at"] = 0
         _detected_sync_server["checked"] = False
+        self._set_detail_text("Re-running all checks...")
         self._run_checks()
 
     def _on_quit(self):
