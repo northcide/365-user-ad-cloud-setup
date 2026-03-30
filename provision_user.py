@@ -369,6 +369,34 @@ def generate_username(first_name: str, last_name: str) -> str:
 #  ACTIVE DIRECTORY OPERATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_ad_upn_suffixes() -> list:
+    """
+    Retrieve all UPN suffixes configured in the AD forest.
+    Returns a list of domain strings (e.g. ["contoso.com", "fabrikam.com"]).
+    Includes both the default forest domain and any additional UPN suffixes.
+    """
+    script = """
+    Import-Module ActiveDirectory
+    $forest = Get-ADForest
+    $suffixes = @($forest.Name)
+    $suffixes += $forest.UPNSuffixes
+    $suffixes | Sort-Object | ConvertTo-Json -Compress
+    """
+    success, stdout, stderr = run_powershell(script, timeout=15)
+    if not success:
+        logger.warning("Could not retrieve UPN suffixes: %s", stderr)
+        return []
+
+    try:
+        data = json.loads(stdout) if stdout else []
+        if isinstance(data, str):
+            data = [data]
+        return [s for s in data if s]
+    except json.JSONDecodeError:
+        logger.warning("Could not parse UPN suffixes: %s", stdout[:200])
+        return []
+
+
 def get_ad_ous() -> list:
     """
     Retrieve all Organizational Units from Active Directory.
@@ -816,28 +844,41 @@ def assign_license(user_id: str, sku_id: str, disabled_plans: list = None) -> tu
 def get_cloud_groups() -> list:
     """
     Fetch cloud-only groups from Entra ID (security and M365 groups).
-    Filters out on-prem synced groups (those have onPremisesSyncEnabled=true).
+    Filters out on-prem synced groups client-side (the $filter + $orderby
+    combo fails on some tenants).
 
     Returns list of dicts: id, display_name, description, group_type
     """
     try:
-        # Fetch groups that are NOT synced from on-prem
+        # Fetch all groups — filter client-side to avoid Graph API
+        # issues with $filter + $orderby on some tenants
         resp = requests.get(
             "https://graph.microsoft.com/v1.0/groups"
-            "?$filter=onPremisesSyncEnabled ne true"
-            "&$select=id,displayName,description,groupTypes,securityEnabled,mailEnabled"
-            "&$top=999"
-            "&$orderby=displayName",
+            "?$select=id,displayName,description,groupTypes,securityEnabled,"
+            "mailEnabled,onPremisesSyncEnabled"
+            "&$top=999",
             headers=_graph_headers(),
             timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            error_detail = ""
+            try:
+                error_detail = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                error_detail = resp.text[:200]
+            logger.error("Cloud groups fetch failed (%d): %s",
+                         resp.status_code, error_detail)
+            return []
     except requests.RequestException as e:
         logger.error("Failed to fetch cloud groups: %s", e)
         return []
 
     groups = []
     for g in resp.json().get("value", []):
+        # Skip on-prem synced groups — only show cloud-only groups
+        if g.get("onPremisesSyncEnabled") is True:
+            continue
+
         # Determine group type for display
         group_types = g.get("groupTypes", [])
         if "Unified" in group_types:
@@ -854,6 +895,7 @@ def get_cloud_groups() -> list:
             "group_type": gtype,
         })
 
+    groups.sort(key=lambda x: x["display_name"].lower())
     return groups
 
 
@@ -1762,9 +1804,9 @@ class ProvisioningApp(tk.Tk):
         ttk.Entry(frame_user, textvariable=self.display_name_var, width=20).grid(
             row=r, column=1, sticky="ew", pady=(3, 0), padx=(0, 8))
         ttk.Label(frame_user, text="Email *").grid(row=r, column=2, sticky="w", pady=(3, 0))
-        email_combo = ttk.Combobox(frame_user, textvariable=self.email_domain_var,
-                                    values=email_domains, width=17, state="readonly")
-        email_combo.grid(row=r, column=3, sticky="ew", pady=(3, 0))
+        self.email_combo = ttk.Combobox(frame_user, textvariable=self.email_domain_var,
+                                         values=email_domains, width=17)
+        self.email_combo.grid(row=r, column=3, sticky="ew", pady=(3, 0))
 
         r += 1
         ttk.Label(frame_user, text="Username *").grid(row=r, column=0, sticky="w", pady=(3, 0))
@@ -1936,6 +1978,7 @@ class ProvisioningApp(tk.Tk):
         """Load AD and Graph data in background threads on startup."""
         self._run_in_thread(self._load_ad_ous, on_complete=self._populate_ous)
         self._run_in_thread(self._load_ad_groups, on_complete=self._populate_ad_groups)
+        self._run_in_thread(self._load_upn_suffixes, on_complete=self._populate_email_domains)
         self._run_in_thread(self._load_cloud_groups, on_complete=self._populate_cloud_groups)
         self._run_in_thread(self._load_licenses, on_complete=self._populate_licenses)
         self._run_in_thread(self._detect_sync, on_complete=self._show_sync_status)
@@ -1954,6 +1997,24 @@ class ProvisioningApp(tk.Tk):
         self.ou_combo["values"] = display_values
         if display_values:
             self.ou_combo.current(0)
+
+    def _load_upn_suffixes(self):
+        return get_ad_upn_suffixes()
+
+    def _populate_email_domains(self, ad_suffixes):
+        """Merge AD UPN suffixes with config email_domains for the dropdown."""
+        config_domains = cfg.get("email_domains", [])
+        # Combine: config domains first, then any AD suffixes not already listed
+        all_domains = list(config_domains)
+        for suffix in ad_suffixes:
+            if suffix.lower() not in [d.lower() for d in all_domains]:
+                all_domains.append(suffix)
+        if all_domains:
+            self.email_combo["values"] = all_domains
+            # Keep current selection if valid, otherwise select first
+            if not self.email_domain_var.get() or \
+               self.email_domain_var.get() not in all_domains:
+                self.email_domain_var.set(all_domains[0])
 
     def _load_ad_groups(self):
         return get_ad_security_groups()
@@ -1984,8 +2045,8 @@ class ProvisioningApp(tk.Tk):
 
         if not groups:
             self.cloud_groups_status.configure(
-                text="No cloud groups found (Graph auth may not be configured)",
-                foreground="orange")
+                text="No cloud-only groups found (all groups may be synced from AD)",
+                foreground="gray")
             return
 
         for i, g in enumerate(groups):
