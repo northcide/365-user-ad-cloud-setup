@@ -465,19 +465,32 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     Returns a list of group DN strings.
     """
     safe_sam = sanitize_for_powershell(sam_account_name)
+    logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
     script = f"""
     Import-Module ActiveDirectory
-    $user = Get-ADUser -Identity '{safe_sam}' -Properties MemberOf
-    $groups = @($user.MemberOf)
-    if ($groups.Count -gt 0) {{
-        $groups | ConvertTo-Json -Compress
-    }} else {{
+    $ErrorActionPreference = 'Stop'
+    try {{
+        $user = Get-ADUser -Identity '{safe_sam}' -Properties MemberOf
+        $count = 0
+        if ($user.MemberOf) {{ $count = $user.MemberOf.Count }}
+        Write-Host "MEMBEROF_COUNT:$count"
+        if ($count -gt 0) {{
+            $user.MemberOf | ConvertTo-Json -Compress
+        }} else {{
+            Write-Output '[]'
+        }}
+    }} catch {{
+        Write-Host "ERROR:$($_.Exception.Message)"
         Write-Output '[]'
     }}
     """
     success, stdout, stderr = run_powershell(script, timeout=15)
+    logger.info("AD groups raw stdout (%d chars): %s", len(stdout), stdout[:500])
+    if stderr:
+        logger.info("AD groups stderr: %s", stderr[:300])
+
     if not success:
-        logger.warning("Failed to get user AD groups: %s", stderr)
+        logger.warning("Failed to get user AD groups (exit code): %s", stderr[:300])
         return []
 
     try:
@@ -487,7 +500,7 @@ def get_user_ad_groups(sam_account_name: str) -> list:
         logger.info("User AD groups found: %d", len(data))
         return data
     except json.JSONDecodeError:
-        logger.warning("Could not parse user AD groups: %s", stdout[:200])
+        logger.warning("Could not parse user AD groups: %s", stdout[:300])
         return []
 
 
