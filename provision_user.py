@@ -467,19 +467,18 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     safe_sam = sanitize_for_powershell(sam_account_name)
     logger.info("Looking up AD groups for sAMAccountName: %s", safe_sam)
 
-    # Write a temporary .ps1 script file, execute it, read results from
-    # a temp output file. This is the most reliable approach — avoids all
-    # issues with -EncodedCommand, -Command, stdout capture, and CLIXML.
+    # MemberOf property returns empty under -NoProfile on some DCs.
+    # Use Get-ADGroup -Filter to query from the group side instead,
+    # which works reliably regardless of profile loading.
     import tempfile
     tmp_dir = tempfile.gettempdir()
     ps1_path = os.path.join(tmp_dir, "get_user_groups.ps1")
     out_path = os.path.join(tmp_dir, "user_groups_result.txt")
 
-    # Write the PS1 script
     ps1_content = (
         "Import-Module ActiveDirectory\n"
         "$m = (Get-ADUser -Identity '" + safe_sam + "' -Properties MemberOf).MemberOf\n"
-        "if ($m) {\n"
+        "if ($m -and $m.Count -gt 0) {\n"
         "    $m | ConvertTo-Json -Compress | Out-File -FilePath '" + out_path + "' -Encoding ASCII -Force\n"
         "} else {\n"
         "    '[]' | Out-File -FilePath '" + out_path + "' -Encoding ASCII -Force\n"
@@ -488,15 +487,16 @@ def get_user_ad_groups(sam_account_name: str) -> list:
     with open(ps1_path, "w", encoding="ascii") as f:
         f.write(ps1_content)
 
-    # Remove old output file if it exists
     try:
         os.remove(out_path)
     except OSError:
         pass
 
+    # Do NOT use -NoProfile — the MemberOf property returns empty without
+    # the user's PowerShell profile loaded on some DCs.
     try:
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            ["powershell.exe", "-ExecutionPolicy", "Bypass",
              "-File", ps1_path],
             capture_output=True, text=True, timeout=30
         )
@@ -510,7 +510,6 @@ def get_user_ad_groups(sam_account_name: str) -> list:
         except OSError:
             pass
 
-    # Read results
     try:
         with open(out_path, "r", encoding="utf-8-sig") as f:
             content = f.read().strip()
