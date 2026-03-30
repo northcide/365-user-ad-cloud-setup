@@ -2535,7 +2535,7 @@ REMEDIATION = {
     "powershell": {
         CHECK_FAIL: (
             "HOW TO FIX: PowerShell Not Available\n"
-            "=" * 36 + "\n"
+            "====================================\n"
             "This tool must run on a Windows machine with PowerShell.\n\n"
             "1. This EXE is designed to run on a Windows Domain Controller.\n"
             "2. If you're testing on a non-Windows machine, the tool won't work.\n"
@@ -2546,7 +2546,7 @@ REMEDIATION = {
     "ad_module": {
         CHECK_FAIL: (
             "HOW TO FIX: Active Directory PowerShell Module\n"
-            "=" * 46 + "\n"
+            "==============================================\n"
             "The AD module is required to create users and query the domain.\n\n"
             "If running on a Domain Controller:\n"
             "  - The module should already be installed. Try:\n"
@@ -2564,7 +2564,7 @@ REMEDIATION = {
     "ad_permissions": {
         CHECK_FAIL: (
             "HOW TO FIX: AD Permissions\n"
-            "=" * 26 + "\n"
+            "==========================\n"
             "The current user cannot query Active Directory.\n\n"
             "1. Right-click the EXE and select 'Run as administrator'\n"
             "2. Ensure you are logged in as a Domain Admin, or an account with\n"
@@ -2581,35 +2581,35 @@ REMEDIATION = {
     "network": {
         CHECK_FAIL: (
             "HOW TO FIX: Network Connectivity\n"
-            "=" * 32 + "\n"
+            "================================\n"
             "The DC must reach Microsoft cloud endpoints over HTTPS (port 443).\n\n"
             "Required endpoints:\n"
             "  - login.microsoftonline.com  (Entra ID authentication)\n"
             "  - graph.microsoft.com        (Microsoft Graph API)\n\n"
             "Troubleshooting:\n"
-            "1. Check firewall rules \u2014 port 443 outbound must be open to these hosts\n"
-            "2. Check proxy settings \u2014 if the DC uses a web proxy:\n"
+            "1. Check firewall rules -- port 443 outbound must be open to these hosts\n"
+            "2. Check proxy settings -- if the DC uses a web proxy:\n"
             "   netsh winhttp show proxy\n"
             "3. Test manually:\n"
             "   Test-NetConnection login.microsoftonline.com -Port 443\n"
             "   Test-NetConnection graph.microsoft.com -Port 443\n"
             "4. If using a proxy, set the system proxy:\n"
             "   netsh winhttp set proxy proxy-server:port\n"
-            "5. DNS resolution \u2014 verify the DC can resolve these hostnames:\n"
+            "5. DNS resolution -- verify the DC can resolve these hostnames:\n"
             "   Resolve-DnsName login.microsoftonline.com"
         ),
     },
     "certificate": {
         CHECK_FAIL: (
             "HOW TO FIX: Graph API Certificate\n"
-            "=" * 33 + "\n"
+            "=================================\n"
             "A certificate is needed so this tool can authenticate to Microsoft 365\n"
             "without storing a password. Each customer needs their own certificate.\n\n"
-            "OPTION A \u2014 Generate Certificate (click 'Generate Cert' button below)\n"
+            "OPTION A -- Generate Certificate (click 'Generate Cert' button below)\n"
             "  The button will create a self-signed certificate automatically,\n"
             "  DPAPI-encrypt the private key, and place it at the expected path.\n"
             "  You'll still need to upload the public key (.cer) to Azure.\n\n"
-            "OPTION B \u2014 Run the Setup Wizard (click 'Run Setup Wizard' below)\n"
+            "OPTION B -- Run the Setup Wizard (click 'Run Setup Wizard' below)\n"
             "  The wizard will walk you through generating a certificate and\n"
             "  configuring all settings step by step.\n\n"
             "After generating, update config.json with the thumbprint,\n"
@@ -2617,7 +2617,7 @@ REMEDIATION = {
         ),
         CHECK_WARN: (
             "WARNING: Certificate File Issue\n"
-            "=" * 31 + "\n"
+            "===============================\n"
             "The file exists but may not be a valid PEM certificate or\n"
             "DPAPI-encrypted file.\n\n"
             "Expected formats:\n"
@@ -2633,11 +2633,11 @@ REMEDIATION = {
     "graph_auth": {
         CHECK_FAIL: (
             "HOW TO FIX: Microsoft 365 Login\n"
-            "=" * 31 + "\n"
+            "===============================\n"
             "The tool could not authenticate to this customer's Microsoft 365 tenant.\n\n"
             "For each customer, you need an App Registration in THEIR Entra ID tenant.\n\n"
             "  Step 1: Create the App Registration\n"
-            "  " + "\u2500" * 36 + "\n"
+            "  ------------------------------------\n"
             "  1. Sign in to portal.azure.com as a Global Admin for the customer\n"
             "  2. Go to: Entra ID > App registrations > New registration\n"
             "  3. Name: 'User Provisioning Tool'\n"
@@ -2647,13 +2647,13 @@ REMEDIATION = {
             "     - Application (client) ID  ->  graph_client_id in config.json\n"
             "     - Directory (tenant) ID    ->  graph_tenant_id in config.json\n\n"
             "  Step 2: Upload the Certificate\n"
-            "  " + "\u2500" * 30 + "\n"
+            "  ------------------------------\n"
             "  1. In the App Registration, go to: Certificates & secrets\n"
             "  2. Click 'Upload certificate'\n"
             "  3. Upload the .cer public key file (from the certificate step)\n"
             "  4. Copy the thumbprint shown -> graph_cert_thumbprint in config.json\n\n"
             "  Step 3: Grant API Permissions\n"
-            "  " + "\u2500" * 29 + "\n"
+            "  -----------------------------\n"
             "  1. In the App Registration, go to: API permissions\n"
             "  2. Click 'Add a permission' > Microsoft Graph > Application permissions\n"
             "  3. Add these permissions:\n"
@@ -2663,9 +2663,9 @@ REMEDIATION = {
             "     - Group.ReadWrite.All\n"
             "     - GroupMember.ReadWrite.All\n"
             "  4. Click 'Grant admin consent for <tenant name>'\n"
-            "     (requires Global Admin \u2014 the green checkmarks must appear)\n\n"
+            "     (requires Global Admin -- the green checkmarks must appear)\n\n"
             "  Step 4: Update config.json\n"
-            "  " + "\u2500" * 27 + "\n"
+            "  --------------------------\n"
             f"  Edit {CONFIG_PATH} with the customer's values:\n"
             "    graph_tenant_id: '<Directory (tenant) ID>'\n"
             "    graph_client_id: '<Application (client) ID>'\n"
@@ -2673,16 +2673,20 @@ REMEDIATION = {
             "  Or use the 'Run Setup Wizard' button to configure interactively.\n\n"
             "  Then click 'Retry' to re-run checks.\n\n"
             "COMMON ERRORS:\n"
-            "  - AADSTS700016: App not found \u2014 wrong Client ID or Tenant ID\n"
-            "  - AADSTS700027: Certificate mismatch \u2014 wrong thumbprint or cert not uploaded\n"
-            "  - AADSTS7000215: Invalid client secret \u2014 using secret instead of cert\n"
-            "  - AADSTS50034: User account doesn't exist \u2014 wrong tenant"
+            "  - AADSTS700016: App not found -- wrong Client ID or Tenant ID\n"
+            "  - AADSTS700027: Certificate mismatch -- wrong thumbprint or cert not uploaded\n"
+            "  - AADSTS7000215: Invalid client secret -- using secret instead of cert\n"
+            "  - AADSTS50034: User account doesn't exist -- wrong tenant\n"
+            "  - 'could not parse the provided public key' -- certificate format\n"
+            "    issue. Re-generate the cert using the Setup Wizard or\n"
+            "    Generate Cert button. The PEM must contain both the private\n"
+            "    key and certificate (public key) sections."
         ),
     },
     "graph_perms": {
         CHECK_FAIL: (
             "HOW TO FIX: Graph API Permissions\n"
-            "=" * 33 + "\n"
+            "=================================\n"
             "Authentication works, but the app is missing required permissions.\n\n"
             "1. Go to: portal.azure.com > Entra ID > App registrations\n"
             "2. Select the 'User Provisioning Tool' app\n"
@@ -2702,22 +2706,22 @@ REMEDIATION = {
         ),
         CHECK_WARN: (
             "WARNING: Partial Permissions\n"
-            "=" * 28 + "\n"
+            "============================\n"
             "License management works, but cloud group management is not available.\n\n"
             "To enable cloud group assignment, add these permissions to the App Registration:\n"
             "  - Group.ReadWrite.All\n"
             "  - GroupMember.ReadWrite.All\n\n"
             "Then grant admin consent and click 'Retry'.\n\n"
-            "You can continue without this \u2014 on-prem AD groups and licensing will still work."
+            "You can continue without this -- on-prem AD groups and licensing will still work."
         ),
     },
     "adsync": {
         CHECK_WARN: (
             "INFO: Entra Connect Sync Server\n"
-            "=" * 31 + "\n"
+            "===============================\n"
             "The tool couldn't automatically detect where Entra Connect is installed.\n"
             "This is common if the sync agent is on a member server (not a DC).\n\n"
-            "You can still use the tool \u2014 in the main window you'll see options to:\n"
+            "You can still use the tool -- in the main window you'll see options to:\n"
             "  - Enter the sync server hostname manually\n"
             "  - Skip sync entirely (and trigger it yourself)\n\n"
             "To find the Entra Connect server:\n"
@@ -2727,14 +2731,14 @@ REMEDIATION = {
             "     Get-Service ADSync\n\n"
             "If the customer uses Entra Cloud Sync instead of Entra Connect:\n"
             "  - Cloud Sync doesn't have a Start-ADSyncSyncCycle command\n"
-            "  - Select 'Skip sync' in the main window \u2014 cloud sync runs automatically\n"
+            "  - Select 'Skip sync' in the main window -- cloud sync runs automatically\n"
             "    and the tool will poll until the user appears in Entra ID."
         ),
     },
     "config": {
         CHECK_FAIL: (
             "HOW TO FIX: Configuration Not Found\n"
-            "=" * 35 + "\n"
+            "===================================\n"
             f"No config.json found at:\n  {CONFIG_PATH}\n\n"
             "This is expected on first run. Click 'Run Setup Wizard' below\n"
             "to create your configuration interactively.\n\n"
@@ -3094,7 +3098,7 @@ class PreflightDialog(tk.Tk):
         # Show welcome message in detail pane
         self._set_detail_text(
             "CUSTOMER SETUP CHECKLIST\n"
-            "=" * 24 + "\n"
+            "========================\n"
             "For each new customer deployment, you need:\n\n"
             f"  1. Create config.json next to the EXE:\n"
             f"     {CONFIG_PATH}\n"
