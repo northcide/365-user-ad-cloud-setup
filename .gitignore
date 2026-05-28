@@ -7,9 +7,16 @@ __pycache__/
 
 # Certificates and secrets
 *.pem
+*.pem.protected
 *.pfx
 *.cer
 .env
+
+# Customer-specific runtime files (created per deployment by the wizard)
+config.json
+titles.txt
+departments.txt
+offices.txt
 
 # IDE
 .vscode/
