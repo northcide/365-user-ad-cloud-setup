@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime, timezone
 
@@ -65,16 +66,64 @@ def _get_app_dir():
 
 APP_DIR = _get_app_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+TITLES_PATH = os.path.join(APP_DIR, "titles.txt")
+DEPARTMENTS_PATH = os.path.join(APP_DIR, "departments.txt")
+OFFICES_PATH = os.path.join(APP_DIR, "offices.txt")
+
+
+def ensure_lookup_files():
+    """
+    Create empty titles.txt, departments.txt, and offices.txt next to
+    config.json if they don't already exist. The admin populates them
+    manually (one value per line); the provisioning form reads them as
+    drop-down options.
+    """
+    for path in (TITLES_PATH, DEPARTMENTS_PATH, OFFICES_PATH):
+        if not os.path.exists(path):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("")
+            except OSError:
+                pass  # non-fatal; the form will just show an empty dropdown
+
+
+def load_lookup_list(path: str) -> list:
+    """
+    Read a lookup file (one value per line) and return a sorted, deduplicated
+    list. Blank lines and lines starting with '#' are skipped so the admin can
+    leave comments in the file.
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().splitlines()
+    except OSError:
+        return []
+    seen = set()
+    result = []
+    for line in raw:
+        v = line.strip()
+        if not v or v.startswith("#"):
+            continue
+        key = v.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(v)
+    result.sort(key=str.lower)
+    return result
 
 # Defaults for settings that don't need customer input
 DEFAULTS = {
-    "password_min_length": 12,
+    "password_min_length": 8,
     "password_require_upper": True,
     "password_require_lower": True,
     "password_require_digit": True,
     "password_require_special": True,
     "entra_poll_interval_seconds": 15,
     "entra_poll_timeout_seconds": 300,
+    "default_usage_location": "US",
     "log_dir": r"C:\Logs",
     "log_file": r"C:\Logs\UserProvisioning.log",
     "log_level": "INFO",
@@ -91,6 +140,158 @@ REQUIRED_CONFIG_KEYS = [
 
 # Graph scopes are constant — not customer-specific
 GRAPH_SCOPES = ["https://graph.microsoft.com/.default"]
+
+# Friendly country name -> ISO 3166-1 alpha-2 code. Microsoft Graph's
+# usageLocation property expects the 2-letter code; the Entra portal UI
+# displays the friendly name. The form's combobox shows the names from this
+# dict; we translate to the code before PATCHing.
+COUNTRY_CODES = {
+    "United States":   "US",
+    "Canada":          "CA",
+    "United Kingdom":  "GB",
+    "Ireland":         "IE",
+    "Australia":       "AU",
+    "New Zealand":     "NZ",
+    "South Africa":    "ZA",
+    "Germany":         "DE",
+    "France":          "FR",
+    "Italy":           "IT",
+    "Spain":           "ES",
+    "Portugal":        "PT",
+    "Netherlands":     "NL",
+    "Belgium":         "BE",
+    "Luxembourg":      "LU",
+    "Switzerland":     "CH",
+    "Austria":         "AT",
+    "Sweden":          "SE",
+    "Norway":          "NO",
+    "Denmark":         "DK",
+    "Finland":         "FI",
+    "Iceland":         "IS",
+    "Poland":          "PL",
+    "Czech Republic":  "CZ",
+    "Hungary":         "HU",
+    "Romania":         "RO",
+    "Greece":          "GR",
+    "Mexico":          "MX",
+    "Brazil":          "BR",
+    "Argentina":       "AR",
+    "Chile":           "CL",
+    "Colombia":        "CO",
+    "India":           "IN",
+    "Japan":           "JP",
+    "China":           "CN",
+    "South Korea":     "KR",
+    "Singapore":       "SG",
+    "Hong Kong":       "HK",
+    "Taiwan":          "TW",
+    "Philippines":     "PH",
+    "Israel":          "IL",
+    "United Arab Emirates": "AE",
+    "Saudi Arabia":    "SA",
+    "Turkey":          "TR",
+}
+
+# Built-in SkuPartNumber → friendly name. Sourced from Microsoft's product
+# names reference. The config "license_skus" map (if present) overrides any
+# entry here. Covers the SKUs most MSPs touch; unknown SKUs fall back to the
+# raw SkuPartNumber.
+SKU_FRIENDLY_NAMES = {
+    # Office 365 SKUs
+    "STANDARDPACK":             "Office 365 E1",
+    "STANDARDWOFFPACK":         "Office 365 E2",
+    "ENTERPRISEPACK":           "Office 365 E3",
+    "ENTERPRISEPACKLRG":        "Office 365 E3",
+    "ENTERPRISEWITHSCAL":       "Office 365 E4",
+    "ENTERPRISEPREMIUM":        "Office 365 E5",
+    "ENTERPRISEPREMIUM_NOPSTNCONF": "Office 365 E5 (no PSTN Conf)",
+    "DESKLESSPACK":             "Office 365 F3",
+    "MIDSIZEPACK":              "Office 365 Midsize",
+    "LITEPACK":                 "Office 365 Small Business",
+    "LITEPACK_P2":              "Office 365 Small Business Premium",
+    # Microsoft 365 enterprise / frontline
+    "SPE_E3":                   "Microsoft 365 E3",
+    "SPE_E5":                   "Microsoft 365 E5",
+    "SPE_F1":                   "Microsoft 365 F1",
+    "SPE_F3":                   "Microsoft 365 F3",
+    "M365_F1":                  "Microsoft 365 F1",
+    "M365EDU_A1":               "Microsoft 365 A1 for Faculty",
+    "M365EDU_A3_STUUSEBNFT":    "Microsoft 365 A3 for Students (use benefit)",
+    "M365EDU_A3_FACULTY":       "Microsoft 365 A3 for Faculty",
+    "M365EDU_A5_FACULTY":       "Microsoft 365 A5 for Faculty",
+    # Microsoft 365 Business
+    "SPB":                      "Microsoft 365 Business Premium",
+    "O365_BUSINESS":            "Microsoft 365 Apps for Business",
+    "SMB_BUSINESS":             "Microsoft 365 Apps for Business",
+    "O365_BUSINESS_ESSENTIALS": "Microsoft 365 Business Basic",
+    "SMB_BUSINESS_ESSENTIALS":  "Microsoft 365 Business Basic",
+    "O365_BUSINESS_PREMIUM":    "Microsoft 365 Business Standard",
+    "SMB_BUSINESS_PREMIUM":     "Microsoft 365 Business Standard",
+    "OFFICESUBSCRIPTION":       "Microsoft 365 Apps for Enterprise",
+    # Exchange Online
+    "EXCHANGESTANDARD":         "Exchange Online (Plan 1)",
+    "EXCHANGEENTERPRISE":       "Exchange Online (Plan 2)",
+    "EXCHANGEDESKLESS":         "Exchange Online Kiosk",
+    "EXCHANGE_S_ESSENTIALS":    "Exchange Online Essentials",
+    "EXCHANGEARCHIVE_ADDON":    "Exchange Online Archiving",
+    # Defender / security
+    "ATP_ENTERPRISE":           "Microsoft Defender for Office 365 (Plan 1)",
+    "THREAT_INTELLIGENCE":      "Microsoft Defender for Office 365 (Plan 2)",
+    "WIN_DEF_ATP":              "Microsoft Defender for Endpoint (Plan 2)",
+    "DEFENDER_ENDPOINT_P1":     "Microsoft Defender for Endpoint (Plan 1)",
+    "ATA":                      "Microsoft Defender for Identity",
+    # Enterprise Mobility / Entra
+    "EMS":                      "Enterprise Mobility + Security E3",
+    "EMSPREMIUM":               "Enterprise Mobility + Security E5",
+    "AAD_PREMIUM":              "Microsoft Entra ID P1",
+    "AAD_PREMIUM_P2":           "Microsoft Entra ID P2",
+    "AAD_BASIC":                "Microsoft Entra ID Basic",
+    # Intune
+    "INTUNE_A":                 "Microsoft Intune Plan 1",
+    "INTUNE_SMB":               "Microsoft Intune for SMB",
+    "INTUNE_A_VL":              "Microsoft Intune Plan 1 (VL)",
+    # Power Platform / Power BI
+    "POWER_BI_STANDARD":        "Power BI (free)",
+    "POWER_BI_PRO":             "Power BI Pro",
+    "POWER_BI_PREMIUM_PER_USER": "Power BI Premium (Per User)",
+    "FLOW_FREE":                "Power Automate Free",
+    "POWERAPPS_VIRAL":          "Power Apps Plan 2 Trial",
+    "POWERAPPS_PER_USER":       "Power Apps Premium",
+    # Project / Visio
+    "PROJECTPROFESSIONAL":      "Project Plan 3",
+    "PROJECTPREMIUM":           "Project Plan 5",
+    "PROJECT_P1":               "Project Plan 1",
+    "PROJECTESSENTIALS":        "Project Online Essentials",
+    "VISIOCLIENT":              "Visio Plan 2",
+    "VISIO_PLAN1_DEPT":         "Visio Plan 1",
+    # Teams / phone
+    "TEAMS1":                   "Microsoft Teams (free)",
+    "MS_TEAMS_IW":              "Microsoft Teams (free)",
+    "TEAMS_EXPLORATORY":        "Microsoft Teams Exploratory",
+    "MCOMEETADV":               "Microsoft 365 Audio Conferencing",
+    "MCOEV":                    "Microsoft 365 Phone System",
+    "MCOSTANDARD":              "Skype for Business Online (Plan 2)",
+    "MCOIMP":                   "Skype for Business Online (Plan 1)",
+    "MCOPSTN1":                 "Microsoft 365 Domestic Calling Plan",
+    "MCOPSTN2":                 "Microsoft 365 Domestic & Intl Calling Plan",
+    # Windows
+    "WIN10_PRO_ENT_SUB":        "Windows 10/11 Enterprise E3",
+    "WIN10_VDA_E5":             "Windows 10/11 Enterprise E5",
+}
+
+
+# ISO 3166-1 numeric codes for the same set above. Optional — populated on
+# AD's countryCode attribute when known. Missing entries are simply omitted.
+ISO_COUNTRY_NUMERIC = {
+    "US": 840, "CA": 124, "GB": 826, "IE": 372, "AU": 36, "NZ": 554,
+    "ZA": 710, "DE": 276, "FR": 250, "IT": 380, "ES": 724, "PT": 620,
+    "NL": 528, "BE": 56, "LU": 442, "CH": 756, "AT": 40, "SE": 752,
+    "NO": 578, "DK": 208, "FI": 246, "IS": 352, "PL": 616, "CZ": 203,
+    "HU": 348, "RO": 642, "GR": 300, "MX": 484, "BR": 76, "AR": 32,
+    "CL": 152, "CO": 170, "IN": 356, "JP": 392, "CN": 156, "KR": 410,
+    "SG": 702, "HK": 344, "TW": 158, "PH": 608, "IL": 376, "AE": 784,
+    "SA": 682, "TR": 792,
+}
 
 # UI constants — not customer-specific
 WINDOW_SIZE = "1050x720"
@@ -128,6 +329,42 @@ def load_config() -> dict:
 
 # Load config at module level — used by all functions
 cfg = load_config()
+
+
+def update_config(updates: dict) -> tuple:
+    """
+    Persist key/value updates into config.json on disk and refresh the
+    module-level ``cfg`` so subsequent reads see the new values.
+
+    Only the existing file's keys are preserved; unrelated keys are left
+    alone. Writes atomically via a temp file + os.replace so a crash mid-write
+    can't truncate the config.
+
+    Returns:
+        (success, error_message)
+    """
+    global cfg
+    # Read current on-disk state (don't trust cfg — it may be stale)
+    on_disk = {}
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                on_disk = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            return False, f"Could not read existing config: {e}"
+
+    on_disk.update(updates)
+
+    tmp_path = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(on_disk, f, indent=2)
+        os.replace(tmp_path, CONFIG_PATH)
+    except OSError as e:
+        return False, f"Could not write config: {e}"
+
+    cfg = load_config()
+    return True, ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,17 +508,27 @@ def run_powershell(script: str, timeout: int = 30) -> tuple:
     """
     Execute a PowerShell script via subprocess using -EncodedCommand for safety.
 
+    The CREATE_NO_WINDOW flag (Windows-only) prevents each call from flashing a
+    console window — important because the EXE is built with --windowed, so the
+    GUI process itself has no console to inherit, and every powershell.exe
+    subprocess would otherwise spawn its own visible window.
+
     Returns:
         (success: bool, stdout: str, stderr: str)
     """
     # Encode the script as base64 UTF-16LE for -EncodedCommand
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
+    kwargs = {}
+    if os.name == "nt":
+        # CREATE_NO_WINDOW = 0x08000000; available as subprocess.CREATE_NO_WINDOW
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
     try:
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-            capture_output=True, text=True, timeout=timeout
+            capture_output=True, text=True, timeout=timeout, **kwargs
         )
         success = result.returncode == 0
         return success, result.stdout.strip(), result.stderr.strip()
@@ -333,28 +580,288 @@ def validate_password_complexity(password: str) -> tuple:
     return len(errors) == 0, errors
 
 
+# Simple 4- and 5-letter words for passphrase generation. Curated to avoid
+# ambiguous spellings, offensive terms, and look-alike pairs.
+PASSPHRASE_WORDS_4 = [
+    "able", "acid", "aqua", "arch", "army", "atom", "back", "bake", "bark",
+    "bark", "barn", "bass", "bath", "beam", "bean", "bear", "beat", "beef",
+    "bell", "best", "bike", "bind", "bird", "blue", "boat", "bold", "bolt",
+    "bone", "book", "boom", "boot", "born", "brag", "brew", "buds", "bulb",
+    "bull", "bunt", "burn", "bush", "bust", "byte", "cafe", "cake", "calf",
+    "calm", "camp", "card", "cart", "case", "cash", "cast", "cave", "cell",
+    "chef", "chip", "city", "clip", "club", "coal", "coat", "code", "coin",
+    "cold", "comb", "cone", "cook", "cool", "cord", "core", "corn", "crew",
+    "crop", "cube", "curl", "dark", "dart", "data", "dawn", "deck", "deep",
+    "deer", "desk", "dial", "dice", "dish", "disk", "dive", "dock", "doll",
+    "done", "door", "dose", "drag", "draw", "drew", "drip", "drop", "drum",
+    "duck", "dust", "easy", "echo", "edge", "epic", "even", "exit", "face",
+    "fact", "fair", "farm", "fast", "fern", "film", "find", "fine", "fire",
+    "fish", "five", "flag", "flat", "flew", "flux", "foam", "fold", "font",
+    "foot", "ford", "form", "fort", "four", "free", "frog", "fuel", "full",
+    "fund", "gain", "gate", "gear", "gift", "girl", "give", "glad", "glee",
+    "glow", "goal", "goat", "gold", "good", "grab", "grew", "grid", "grin",
+    "grip", "gulf", "gulp", "gust", "hail", "half", "hall", "halo", "hand",
+    "hang", "harp", "hawk", "head", "heap", "heat", "help", "herb", "hero",
+    "high", "hike", "hill", "hint", "hive", "home", "hood", "hoof", "hook",
+    "hope", "horn", "host", "hour", "hunt", "hush", "iced", "icon", "iris",
+    "iron", "jade", "jazz", "jeep", "jest", "jewel", "join", "joke", "jump",
+    "kelp", "kept", "kick", "kind", "king", "kite", "knot", "lace", "lake",
+    "lamp", "land", "lane", "lark", "lava", "lawn", "leaf", "lean", "left",
+    "lend", "lens", "lent", "lift", "lily", "lime", "limp", "line", "link",
+    "lion", "list", "live", "loan", "lock", "loft", "long", "look", "loom",
+    "loop", "lord", "lore", "lost", "love", "luck", "lump", "lush", "lute",
+    "lyre", "magma", "mail", "main", "make", "mane", "many", "maps", "mark",
+    "mask", "mast", "mate", "math", "meal", "meet", "menu", "mesh", "mews",
+    "mice", "mild", "mile", "milk", "mill", "mind", "mine", "mint", "mist",
+    "moat", "mode", "moon", "more", "mold", "moss", "moth", "muse", "name",
+    "navy", "neat", "nest", "next", "nice", "node", "noon", "norm", "nose",
+    "note", "oars", "oats", "ocean", "oils", "okay", "open", "oval", "oven",
+    "owls", "page", "paid", "pail", "pair", "palm", "pane", "park", "part",
+    "past", "path", "peak", "pear", "peat", "peek", "perk", "pest", "pier",
+    "pile", "pine", "pink", "pint", "pipe", "play", "plot", "plus", "poem",
+    "poet", "polo", "pond", "pool", "porch", "port", "pose", "post", "pour",
+    "pray", "prep", "prim", "prop", "puff", "pull", "pump", "punt", "pure",
+    "push", "quay", "quiz", "race", "rack", "raft", "rail", "rain", "ramp",
+    "rang", "rank", "rare", "rash", "rate", "raven", "rays", "read", "real",
+    "reed", "reef", "rely", "rest", "rib", "rice", "rich", "ride", "rim",
+    "ring", "rink", "ripe", "rise", "risk", "road", "roam", "robe", "rock",
+    "rode", "role", "roll", "roof", "room", "root", "rope", "rose", "ruby",
+    "rule", "runs", "rush", "sage", "said", "sail", "sale", "salt", "same",
+    "sand", "sang", "save", "scan", "scar", "seal", "sees", "self", "send",
+    "sent", "ship", "shoe", "shop", "shut", "side", "sign", "silk", "silo",
+    "sing", "sink", "size", "skip", "sled", "slim", "slip", "slow", "smug",
+    "snap", "snug", "soap", "sock", "soft", "soil", "sole", "solo", "some",
+    "song", "sort", "soup", "spin", "spot", "star", "stay", "stem", "step",
+    "stir", "stop", "such", "suds", "sums", "sung", "sure", "surf", "swan",
+    "swap", "swim", "tail", "take", "tale", "talk", "tall", "tame", "tank",
+    "tape", "task", "team", "teas", "tell", "tend", "tent", "tern", "test",
+    "thaw", "them", "then", "thus", "tide", "tied", "tier", "tile", "till",
+    "time", "tint", "tips", "tofu", "told", "tomb", "tone", "tool", "tore",
+    "torn", "tour", "town", "trap", "tray", "tree", "trim", "trip", "trot",
+    "true", "tube", "tuck", "tuft", "tugs", "tune", "turf", "turn", "tusk",
+    "twig", "twin", "type", "unit", "upon", "urge", "user", "vail", "vain",
+    "vale", "vane", "vase", "vast", "veil", "vein", "verb", "very", "vest",
+    "view", "vine", "void", "vote", "wade", "wage", "wait", "wake", "walk",
+    "wall", "wand", "want", "ward", "warm", "warn", "wash", "watt", "wave",
+    "wear", "week", "well", "went", "west", "what", "when", "wide", "wife",
+    "wild", "wind", "wine", "wing", "wink", "wins", "wipe", "wire", "wise",
+    "wish", "wolf", "wood", "wool", "word", "work", "worm", "worn", "wrap",
+    "yarn", "yawn", "year", "yell", "yoga", "yolk", "your", "yoyo", "zeal",
+    "zero", "zinc", "zone", "zoom",
+]
+PASSPHRASE_WORDS_5 = [
+    "acorn", "agile", "alarm", "album", "amber", "angel", "ankle", "apple",
+    "apron", "arena", "aroma", "arrow", "asset", "atlas", "audio", "avoid",
+    "award", "aware", "azure", "badge", "baker", "balmy", "banjo", "basic",
+    "basil", "batch", "beach", "beads", "beans", "beard", "beast", "berry",
+    "bingo", "birch", "black", "blade", "blame", "blast", "blaze", "blend",
+    "bless", "blimp", "blink", "blitz", "block", "blond", "bloom", "blown",
+    "blue", "blunt", "blush", "board", "boast", "bonus", "boost", "boots",
+    "boxer", "brave", "bread", "break", "brick", "bride", "brief", "brine",
+    "bring", "brisk", "brook", "broom", "broth", "brown", "brush", "buddy",
+    "bunny", "burst", "cable", "cabin", "candy", "canoe", "canon", "cards",
+    "carol", "carve", "cedar", "chalk", "chant", "charm", "chart", "cheek",
+    "cheer", "chess", "chest", "chick", "chief", "child", "chili", "chime",
+    "chips", "chord", "chunk", "claim", "clams", "clash", "clasp", "claws",
+    "clean", "clear", "cleat", "clerk", "click", "cliff", "climb", "cling",
+    "clink", "cloak", "clock", "close", "cloth", "cloud", "clout", "clove",
+    "clown", "clubs", "clump", "coach", "coast", "cocoa", "color", "colts",
+    "comet", "couch", "cough", "court", "cover", "craft", "crane", "crank",
+    "crash", "crate", "crave", "craze", "cream", "creek", "crest", "crisp",
+    "crops", "cross", "crowd", "crown", "crumb", "crust", "cubed", "curly",
+    "daisy", "dance", "dandy", "dares", "decoy", "delta", "dense", "depth",
+    "diary", "diner", "dingo", "ditch", "dives", "dizzy", "dough", "downy",
+    "draft", "drain", "drake", "drama", "drape", "drawn", "dream", "dress",
+    "dried", "drift", "drill", "drink", "drive", "drove", "drum", "ducks",
+    "dukes", "dunes", "dusky", "eagle", "early", "earth", "easel", "eaten",
+    "ebony", "elbow", "elder", "elfin", "elope", "elves", "empty", "enact",
+    "enjoy", "enter", "envoy", "epoch", "equal", "essay", "ethos", "every",
+    "evict", "exact", "excel", "extra", "exult", "fable", "faint", "fairy",
+    "faith", "false", "fancy", "fauna", "favor", "feast", "feels", "fence",
+    "ferry", "field", "fiery", "fifty", "finch", "first", "flair", "flame",
+    "flank", "flare", "flash", "fleet", "flesh", "flick", "flier", "flint",
+    "flips", "float", "flood", "floor", "flora", "flour", "flute", "foamy",
+    "focus", "foggy", "folks", "force", "forge", "forks", "forth", "forty",
+    "found", "frame", "frank", "freed", "fresh", "fries", "frock", "frogs",
+    "front", "frost", "frown", "fruit", "fudge", "funds", "funky", "funny",
+    "fuses", "fuzzy", "gable", "gains", "games", "gaunt", "gavel", "gazed",
+    "genes", "gentle", "germ", "giant", "gifts", "girls", "given", "glade",
+    "glare", "glass", "glaze", "glide", "globe", "gloom", "glory", "glove",
+    "glows", "godly", "going", "golds", "gourd", "grade", "grain", "grand",
+    "grant", "grape", "graph", "grass", "grate", "grave", "gravy", "great",
+    "green", "greet", "grids", "grief", "grill", "grime", "grins", "groan",
+    "groom", "gross", "group", "grout", "grove", "growl", "grown", "guard",
+    "guess", "guest", "guide", "guild", "habit", "halls", "hands", "handy",
+    "happy", "harbor", "hardy", "harps", "harsh", "haste", "haven", "heads",
+    "heaps", "heard", "heart", "heavy", "hedge", "heels", "hello", "hence",
+    "herbs", "herds", "hides", "hippo", "hires", "hitch", "hoist", "holds",
+    "holly", "homes", "honey", "honor", "hoofs", "hooks", "hopes", "horns",
+    "horse", "hosed", "hotel", "hound", "house", "human", "humid", "humor",
+    "hurry", "icons", "ideal", "ideas", "igloo", "image", "imply", "index",
+    "ingot", "inner", "input", "irons", "islet", "issue", "items", "ivory",
+    "jaded", "jelly", "jewel", "jolly", "joust", "joys", "judge", "juice",
+    "juicy", "jumbo", "kayak", "kelps", "kicks", "kilts", "kinds", "kings",
+    "kites", "knack", "knees", "knelt", "knife", "knock", "knots", "known",
+    "label", "lacy", "lakes", "lamb", "lamps", "lance", "lapel", "large",
+    "laser", "later", "latex", "laugh", "layer", "leafy", "leaks", "leaps",
+    "learn", "leash", "least", "ledge", "leek", "lemon", "lifts", "light",
+    "liked", "lilac", "limbs", "limes", "linen", "liner", "lions", "lisle",
+    "lists", "lived", "liver", "lobby", "local", "lodge", "lofty", "logic",
+    "loose", "lords", "loser", "loved", "lower", "loyal", "lucky", "lunar",
+    "lunch", "lungs", "lying", "lyric", "macro", "magic", "magma", "major",
+    "maker", "malls", "manor", "maple", "march", "marsh", "match", "matte",
+    "maybe", "mayor", "meads", "meals", "meant", "medic", "melon", "melts",
+    "merge", "merit", "metal", "meter", "midst", "miles", "milky", "mills",
+    "minds", "mined", "minor", "minty", "mirth", "model", "modem", "moist",
+    "molds", "money", "month", "moody", "moons", "moose", "moral", "moths",
+    "motor", "mound", "mount", "mouse", "mouth", "movie", "mover", "music",
+    "naval", "navel", "neat", "needs", "nests", "never", "newer", "newly",
+    "nicer", "night", "noble", "noise", "noisy", "north", "noted", "notes",
+    "novel", "noxes", "nudge", "nurse", "nylon", "oaken", "ocean", "odder",
+    "offer", "often", "olive", "onset", "opal", "opens", "opera", "orbit",
+    "order", "organ", "other", "otter", "ought", "ounce", "outer", "owned",
+    "owner", "oxide", "pact", "paddy", "pages", "paint", "pairs", "palms",
+    "panda", "panel", "pansy", "pants", "paper", "parks", "parts", "party",
+    "paste", "patch", "paths", "pause", "peace", "peach", "peaks", "pearl",
+    "pears", "pence", "perch", "perks", "petal", "petty", "phone", "photo",
+    "piano", "picks", "piers", "piles", "pilot", "pinch", "pines", "pints",
+    "piped", "pipes", "pitch", "pivot", "pixel", "place", "plain", "plane",
+    "plank", "plant", "plate", "plays", "plaza", "pleat", "plows", "pluck",
+    "plumb", "plume", "poems", "poets", "point", "polar", "polo", "pond",
+    "ponds", "pools", "popcorn", "porch", "ports", "pouch", "pound", "pours",
+    "power", "praise", "press", "pride", "prime", "print", "prize", "probe",
+    "prone", "prong", "proof", "props", "proud", "prove", "prune", "puffs",
+    "pulls", "pulse", "punch", "pupae", "puppy", "pured", "purse", "queen",
+    "quest", "queue", "quick", "quiet", "quilt", "quirk", "quote", "races",
+    "rack", "radar", "rails", "rains", "rainy", "raise", "rally", "ramp",
+    "ranch", "range", "rapid", "rates", "ratio", "raven", "reach", "reads",
+    "ready", "realm", "reaps", "rebar", "redo", "reefs", "regal", "relax",
+    "relay", "renew", "rerun", "reset", "rests", "retry", "revue", "rhyme",
+    "rider", "rifle", "right", "rigid", "rings", "rinks", "ripen", "risen",
+    "rises", "risky", "rival", "river", "roads", "roast", "robin", "robot",
+    "rocks", "rocky", "rodeo", "roger", "rooks", "rooms", "roomy", "roost",
+    "roots", "ropes", "roses", "rotor", "rough", "round", "route", "rover",
+    "rowdy", "royal", "rugby", "ruler", "rumps", "runes", "rungs", "runts",
+    "rural", "rusty", "sable", "sadly", "safer", "sage", "saint", "salad",
+    "salon", "salty", "salts", "sandy", "satin", "sauce", "savor", "scale",
+    "scalp", "scamp", "scans", "scarf", "scary", "scoop", "scope", "score",
+    "scout", "scram", "scrap", "scrub", "scuba", "seals", "seams", "seats",
+    "seeds", "seeks", "seems", "sees", "seize", "sense", "serve", "setup",
+    "seven", "shack", "shade", "shaft", "shady", "shaft", "shake", "shaky",
+    "shale", "shall", "shame", "shape", "share", "shark", "sharp", "shave",
+    "shawl", "sheep", "sheer", "sheet", "shelf", "shell", "shied", "shift",
+    "shine", "shiny", "ships", "shirt", "shoes", "shone", "shook", "shoot",
+    "shops", "shore", "short", "shout", "shown", "shows", "shrug", "sides",
+    "siege", "sieve", "sighs", "sight", "silks", "silky", "silly", "silos",
+    "since", "siren", "sites", "sixty", "sizes", "skate", "skews", "skies",
+    "skill", "skins", "skirt", "skull", "slabs", "slack", "slain", "slang",
+    "slant", "slate", "slave", "sleek", "sleep", "sleet", "slept", "slice",
+    "slick", "slide", "slime", "slips", "sloop", "slope", "slots", "slows",
+    "slugs", "smart", "smash", "smell", "smile", "smith", "smoke", "smoky",
+    "snail", "snake", "snap", "sneak", "snore", "snout", "snowy", "soaks",
+    "soaps", "sober", "socks", "soggy", "solar", "solid", "solos", "songs",
+    "sonic", "soothe", "sorry", "sound", "south", "space", "spade", "spans",
+    "spare", "spark", "spear", "speed", "spell", "spend", "spent", "spice",
+    "spicy", "spied", "spike", "spill", "spine", "spire", "spite", "splat",
+    "split", "spoil", "spoke", "spoon", "sport", "spots", "spout", "spree",
+    "spurs", "squad", "stack", "staff", "stage", "stain", "stair", "stake",
+    "stale", "stalk", "stamp", "stand", "stark", "start", "stash", "state",
+    "stays", "stead", "steak", "steal", "steam", "steed", "steel", "steep",
+    "stems", "steps", "stern", "stews", "stick", "stiff", "still", "stilt",
+    "sting", "stink", "stock", "stoic", "stoke", "stole", "stomp", "stone",
+    "stood", "stool", "stoop", "stops", "store", "stork", "storm", "story",
+    "stout", "stove", "straw", "stray", "strip", "stuck", "study", "stuff",
+    "stunt", "style", "suave", "sugar", "suits", "summer", "sunny", "super",
+    "surfs", "swam", "swamp", "swans", "sweat", "sweep", "sweet", "swell",
+    "swept", "swift", "swims", "swing", "swirl", "sword", "table", "tacky",
+    "tacos", "taffy", "taken", "tales", "talks", "tally", "tamed", "tanks",
+    "tapes", "tasks", "taste", "taut", "teach", "teams", "teeth", "tells",
+    "tempt", "tense", "tents", "terms", "terra", "thank", "their", "theme",
+    "there", "these", "thick", "thigh", "thing", "think", "third", "those",
+    "three", "threw", "throb", "thrown", "thumb", "thump", "tidal", "tides",
+    "tiger", "tight", "tiled", "tiles", "tilts", "timid", "tinge", "tipsy",
+    "tired", "title", "toast", "today", "toils", "token", "tomes", "tonal",
+    "tones", "tools", "tooth", "topic", "torch", "torso", "total", "touch",
+    "tough", "tours", "tower", "towns", "toxin", "trace", "track", "trade",
+    "trail", "train", "trait", "tramp", "traps", "trash", "tread", "treat",
+    "trees", "trend", "tribe", "trick", "tried", "trout", "trunk", "tunes",
+    "turbo", "turf", "tweed", "twice", "twigs", "twins", "twirl", "twist",
+    "tying", "udder", "ulcer", "ultra", "umpire", "uncle", "under", "undue",
+    "unfit", "unfold", "unify", "union", "unite", "unity", "unzip", "upper",
+    "upset", "urban", "urged", "usage", "users", "usher", "vague", "valet",
+    "valid", "value", "vapor", "vault", "vegan", "verbs", "verge", "verse",
+    "vetch", "vials", "video", "views", "villa", "vines", "vinyl", "viola",
+    "viper", "viral", "virus", "visit", "vital", "vivid", "vocal", "vodka",
+    "vogue", "voice", "voids", "votes", "vowel", "wafer", "wagon", "waist",
+    "waits", "waltz", "wands", "wares", "warms", "warns", "warty", "waste",
+    "watch", "water", "watts", "waved", "waves", "weave", "weeds", "weeks",
+    "weeps", "weigh", "weird", "wells", "welds", "wells", "wends", "whale",
+    "wharf", "wheat", "wheel", "where", "which", "while", "whips", "whirl",
+    "white", "whole", "whose", "wider", "widow", "width", "wield", "wilds",
+    "winds", "windy", "winds", "wines", "wings", "winks", "wiped", "wires",
+    "wiser", "witch", "woken", "wolfs", "woman", "women", "wools", "woods",
+    "wools", "woolly", "words", "wordy", "works", "world", "worms", "worry",
+    "worse", "worth", "would", "wound", "woven", "wraps", "wrath", "wreck",
+    "wrist", "write", "wrong", "wrote", "wrung", "yacht", "years", "yeast",
+    "yells", "yield", "yodel", "yoked", "young", "yours", "youth", "yummy",
+    "zebra", "zesty",
+]
+# Simple 3-letter words — added for the short-passphrase generator.
+PASSPHRASE_WORDS_3 = [
+    "ace", "ant", "ape", "ark", "arm", "art", "ash", "axe", "bag", "bat",
+    "bay", "bed", "bee", "big", "bit", "bow", "box", "boy", "bud", "bug",
+    "bus", "cab", "can", "cap", "car", "cat", "cod", "cog", "cow", "cub",
+    "cup", "cut", "dam", "day", "den", "dew", "dim", "dip", "dog", "dot",
+    "dry", "dug", "ear", "eel", "egg", "elf", "elk", "elm", "end", "eve",
+    "eye", "fan", "far", "fed", "few", "fig", "fin", "fir", "fit", "fix",
+    "fly", "fog", "fox", "fun", "fur", "gap", "gas", "gem", "gin", "got",
+    "gum", "gut", "gym", "ham", "hat", "hay", "hen", "hip", "hop", "hub",
+    "hum", "hut", "ice", "ink", "ion", "ivy", "jab", "jam", "jar", "jaw",
+    "jay", "jet", "job", "jog", "joy", "jug", "key", "kid", "kin", "kit",
+    "lab", "lad", "lap", "leg", "lid", "lip", "log", "low", "mad", "man",
+    "map", "mat", "men", "met", "mix", "mob", "mom", "mop", "mud", "mug",
+    "nag", "nap", "net", "new", "nip", "nod", "now", "nun", "nut", "oak",
+    "oar", "oat", "odd", "off", "oil", "old", "one", "orb", "out", "owe",
+    "owl", "pad", "pal", "pan", "pat", "paw", "pay", "pea", "peg", "pen",
+    "pet", "pie", "pig", "pin", "pit", "pop", "pot", "pup", "pug", "pun",
+    "rag", "ram", "rat", "raw", "ray", "red", "rib", "rim", "rip", "rob",
+    "rod", "row", "rub", "rug", "run", "rye", "sad", "sap", "saw", "sea",
+    "see", "set", "she", "ski", "sky", "sly", "sob", "sod", "son", "soy",
+    "spa", "spy", "sub", "sun", "tab", "tad", "tag", "tan", "tap", "tar",
+    "tax", "tea", "ten", "tie", "tin", "tip", "toe", "ton", "top", "toy",
+    "tub", "tug", "two", "use", "van", "vat", "vet", "vow", "wag", "war",
+    "wax", "way", "web", "wed", "wet", "who", "wig", "win", "wit", "woo",
+    "yak", "yam", "yes", "yet", "you", "zap", "zip", "zoo",
+]
+
+# Special characters allowed in the passphrase separator
+PASSPHRASE_SPECIALS = "@#$%*!"
+
+
 def generate_password(length: int = 16) -> str:
-    """Generate a cryptographically random password meeting all complexity requirements."""
-    # Ensure at least one character from each required class
-    chars = []
-    if cfg["password_require_upper"]:
-        chars.append(secrets.choice(string.ascii_uppercase))
-    if cfg["password_require_lower"]:
-        chars.append(secrets.choice(string.ascii_lowercase))
-    if cfg["password_require_digit"]:
-        chars.append(secrets.choice(string.digits))
-    if cfg["password_require_special"]:
-        chars.append(secrets.choice("!@#$%^&*()_+-=[]{}|;:,.<>?"))
+    """
+    Generate a short, memorable passphrase: two simple 3- or 4-letter words
+    separated by a special character (one of @#$%*!), with the first word
+    capitalized and a single trailing digit.
 
-    # Fill remaining length with random chars from the full set
-    all_chars = string.ascii_letters + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
-    remaining = max(0, length - len(chars))
-    chars.extend(secrets.choice(all_chars) for _ in range(remaining))
+    Format:  ``Word1<sep>word2N``
+    Example: ``Cat#dog4``  or  ``Apple#fox2``
 
-    # Shuffle to avoid predictable positions
-    result = list(chars)
-    secrets.SystemRandom().shuffle(result)
-    return "".join(result)
+    Produces 8–10 chars total:
+        3+1+3+1 = 8
+        3+1+4+1 = 9
+        4+1+4+1 = 10
+
+    The ``length`` argument is kept for backward-compat but ignored.
+    """
+    _ = length  # ignored
+    rng = secrets.SystemRandom()
+    short_words = PASSPHRASE_WORDS_3 + PASSPHRASE_WORDS_4
+    word1 = secrets.choice(short_words).capitalize()
+    word2 = secrets.choice(short_words).lower()
+    sep = secrets.choice(PASSPHRASE_SPECIALS)
+    digit = str(rng.randint(0, 9))
+    return f"{word1}{sep}{word2}{digit}"
 
 
 def generate_username(first_name: str, last_name: str) -> str:
@@ -605,23 +1112,59 @@ def create_ad_user(params: dict) -> tuple:
 
     ad_domain = cfg["ad_domain"]
 
+    # mailNickname is set to the full email address (per customer convention
+    # in this environment). proxyAddresses[0] = primary SMTP for Entra Connect
+    # to publish as the user's mail attribute.
+    email = p["email"]
+    mail_nickname = email
+
+    # Use the email's domain in the UPN (not the AD domain) so the cloud UPN
+    # matches a verified domain in Entra ID.
+    upn_domain = email.split("@", 1)[1] if "@" in email else ad_domain
+
+    # Country attributes (set if provided): c=ISO alpha-2, co=friendly name,
+    # countryCode=numeric ISO 3166-1. Entra Connect publishes 'c' to cloud as
+    # the 'country' field. usageLocation is set separately via Graph PATCH.
+    country_code = (params.get("country_code") or "").upper()
+    country_name = params.get("country_name") or ""
+    country_numeric = ISO_COUNTRY_NUMERIC.get(country_code, 0)
+    office = sanitize_for_powershell(params.get("office", ""))
+
+    # Build the $other hashtable dynamically so we don't write empty values
+    other_lines = [
+        f"'mailNickname'   = '{mail_nickname}'",
+        f"'proxyAddresses' = @('SMTP:{email}')",
+    ]
+    if office:
+        other_lines.append(f"'physicalDeliveryOfficeName' = '{office}'")
+    if country_code:
+        other_lines.append(f"'c'           = '{country_code}'")
+    if country_name:
+        safe_country_name = sanitize_for_powershell(country_name)
+        other_lines.append(f"'co'          = '{safe_country_name}'")
+    if country_numeric:
+        other_lines.append(f"'countryCode' = {country_numeric}")
+    other_hash = "@{\n      " + "\n      ".join(other_lines) + "\n    }"
+
     script = f"""
     Import-Module ActiveDirectory
     $secpw = ConvertTo-SecureString -String '{password}' -AsPlainText -Force
+    $other = {other_hash}
     New-ADUser `
       -Name '{p["display_name"]}' `
       -GivenName '{p["first_name"]}' `
       -Surname '{p["last_name"]}' `
       -DisplayName '{p["display_name"]}' `
       -SamAccountName '{p["username"]}' `
-      -UserPrincipalName '{p["username"]}@{ad_domain}' `
-      -EmailAddress '{p["email"]}' `
+      -UserPrincipalName '{p["username"]}@{upn_domain}' `
+      -EmailAddress '{email}' `
       -Title '{p.get("title", "")}' `
       -Department '{p.get("department", "")}' `
       -Path '{p["ou_dn"]}' `
       -AccountPassword $secpw `
       -ChangePasswordAtLogon {force_change} `
       -Enabled $true `
+      -OtherAttributes $other `
       -PassThru |
       Select-Object DistinguishedName |
       ConvertTo-Json -Compress
@@ -822,7 +1365,10 @@ def get_available_licenses() -> list:
     skus = resp.json().get("value", [])
     licenses = []
 
-    # Build reverse lookup from our config for friendly names
+    # Friendly-name resolution order (first hit wins):
+    #   1. config license_skus  — admin override, keyed by friendly_name → sku_id
+    #   2. SKU_FRIENDLY_NAMES   — built-in dict, keyed by SkuPartNumber
+    #   3. raw SkuPartNumber (e.g. ENTERPRISEPACK)
     license_skus = cfg.get("license_skus", {})
     sku_id_to_friendly = {v: k for k, v in license_skus.items()}
 
@@ -831,14 +1377,19 @@ def get_available_licenses() -> list:
             continue
 
         sku_id = sku["skuId"]
+        sku_part = sku.get("skuPartNumber", "Unknown")
         prepaid = sku.get("prepaidUnits", {})
         total = prepaid.get("enabled", 0)
         consumed = sku.get("consumedUnits", 0)
 
+        friendly = (sku_id_to_friendly.get(sku_id)
+                     or SKU_FRIENDLY_NAMES.get(sku_part)
+                     or sku_part)
+
         licenses.append({
             "sku_id": sku_id,
-            "sku_name": sku.get("skuPartNumber", "Unknown"),
-            "friendly_name": sku_id_to_friendly.get(sku_id, sku.get("skuPartNumber", sku_id)),
+            "sku_name": sku_part,
+            "friendly_name": friendly,
             "total": total,
             "consumed": consumed,
             "available": max(0, total - consumed),
@@ -847,6 +1398,70 @@ def get_available_licenses() -> list:
 
     licenses.sort(key=lambda x: x["friendly_name"])
     return licenses
+
+
+def get_user_assigned_licenses(user_upn_or_id: str) -> list:
+    """
+    Fetch all licenses assigned to a user, INCLUDING those inherited via
+    group-based / dynamic-group assignment. Returns a list of dicts:
+        {sku_id, sources: set("user" | "group"), state, assigned_by_groups}
+
+    Uses /users/{id}?$select=assignedLicenses,licenseAssignmentStates so we
+    can distinguish source — licenseDetails alone doesn't reliably tell us
+    whether a license came from a group assignment.
+    """
+    if not user_upn_or_id:
+        return []
+    try:
+        resp = requests.get(
+            f"https://graph.microsoft.com/v1.0/users/{user_upn_or_id}"
+            "?$select=assignedLicenses,licenseAssignmentStates",
+            headers=_graph_headers(), timeout=20,
+        )
+    except requests.RequestException as e:
+        logger.warning("Failed to fetch user licenses: %s", e)
+        return []
+    if resp.status_code != 200:
+        logger.warning("User licenses fetch returned %d", resp.status_code)
+        return []
+    data = resp.json() or {}
+
+    by_sku = {}
+    # licenseAssignmentStates has per-assignment source + state.
+    # Source detection: presence of assignedByGroup is the reliable signal
+    # — assignmentSource is often empty/null for direct assignments. So:
+    #   assignedByGroup present  → "group"
+    #   assignedByGroup absent   → "user" (direct)
+    for state in (data.get("licenseAssignmentStates") or []):
+        sid = state.get("skuId")
+        if not sid:
+            continue
+        st = (state.get("state") or "").lower()
+        # Skip purely disabled/error states; keep Active and ActiveWithError
+        if st and "active" not in st:
+            continue
+        entry = by_sku.setdefault(sid, {
+            "sku_id": sid, "sources": set(),
+            "assigned_by_groups": [], "state": st,
+        })
+        gid = state.get("assignedByGroup")
+        if gid:
+            entry["sources"].add("group")
+            if gid not in entry["assigned_by_groups"]:
+                entry["assigned_by_groups"].append(gid)
+        else:
+            entry["sources"].add("user")
+
+    # Fallback: anything in assignedLicenses that didn't appear in states
+    for al in (data.get("assignedLicenses") or []):
+        sid = al.get("skuId")
+        if sid and sid not in by_sku:
+            by_sku[sid] = {
+                "sku_id": sid, "sources": set(["user"]),
+                "assigned_by_groups": [], "state": "active",
+            }
+
+    return list(by_sku.values())
 
 
 def check_license_availability(sku_id: str, licenses: list) -> tuple:
@@ -881,6 +1496,138 @@ def find_user_in_entra(upn: str) -> dict | None:
     except requests.RequestException as e:
         logger.warning("Entra ID lookup failed: %s", e)
         return None
+
+
+def get_primary_verified_domain() -> str:
+    """
+    Return the tenant's primary verified domain (e.g. 'contoso.com') from
+    Graph. This is the customer's preferred email/UPN domain — almost always
+    different from the on-prem AD domain (which is often *.local).
+
+    Returns an empty string if Graph is unreachable or no default domain found.
+    """
+    try:
+        resp = requests.get(
+            "https://graph.microsoft.com/v1.0/domains"
+            "?$select=id,isDefault,isVerified",
+            headers=_graph_headers(),
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        logger.warning("Could not fetch tenant domains: %s", e)
+        return ""
+    if resp.status_code != 200:
+        logger.warning("Tenant domains fetch failed (%d)", resp.status_code)
+        return ""
+    for d in resp.json().get("value", []):
+        if d.get("isDefault") and d.get("isVerified", True):
+            return d.get("id", "")
+    return ""
+
+
+def set_usage_location(user_id: str, location: str) -> tuple:
+    """
+    PATCH usageLocation on the Entra user and verify it stuck. Required (ISO
+    3166-1 alpha-2, e.g. 'US') before any license can be assigned — otherwise
+    Graph returns 'License assignment cannot be done for user with invalid
+    usage location.'
+
+    A freshly-synced user can fail the PATCH with eventual-consistency errors,
+    and even a successful PATCH sometimes doesn't appear in a subsequent GET
+    immediately (replication race). We retry up to 3 times with backoff and
+    confirm the value via GET before declaring success.
+
+    Returns:
+        (success, error_message)
+    """
+    if not location:
+        return False, "usageLocation is empty"
+    code = location.upper()
+    last_error = ""
+
+    for attempt, delay in enumerate((0, 5, 10)):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = requests.patch(
+                f"https://graph.microsoft.com/v1.0/users/{user_id}",
+                headers=_graph_headers(),
+                json={"usageLocation": code},
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            last_error = str(e)
+            continue
+        if resp.status_code not in (200, 204):
+            try:
+                last_error = resp.json().get("error", {}).get(
+                    "message", resp.text[:300])
+            except Exception:
+                last_error = resp.text[:300]
+            last_error = f"PATCH HTTP {resp.status_code}: {last_error}"
+            # Retry only on transient-looking failures
+            if not any(s in last_error.lower() for s in (
+                    "does not exist", "resource", "timeout", "throttle",
+                    "503", "504")):
+                break
+            continue
+
+        # PATCH returned success — verify the value actually landed
+        try:
+            verify = requests.get(
+                f"https://graph.microsoft.com/v1.0/users/{user_id}"
+                "?$select=usageLocation",
+                headers=_graph_headers(), timeout=20,
+            )
+        except requests.RequestException as e:
+            last_error = f"verify GET failed: {e}"
+            continue
+        if verify.status_code == 200:
+            got = (verify.json() or {}).get("usageLocation") or ""
+            if got.upper() == code:
+                logger.info(
+                    "Set usageLocation=%s on user %s%s",
+                    code, user_id,
+                    f" (attempt {attempt + 1})" if attempt else "")
+                return True, ""
+            last_error = (
+                f"PATCH accepted but GET returned usageLocation="
+                f"{got!r} (expected {code})")
+        else:
+            last_error = f"verify HTTP {verify.status_code}"
+
+    return False, last_error
+
+
+def reprocess_user_license_assignment(user_id: str) -> tuple:
+    """
+    Nudge the License Processing Service to re-evaluate all group-based
+    licensing for this user. Useful right after usageLocation lands, because
+    any group-based assignments that already failed because usageLocation was
+    empty stay in failed state until reprocessed.
+
+    POST /users/{id}/reprocessLicenseAssignment is fire-and-forget; the
+    service replies 200 and queues the actual work.
+
+    Returns:
+        (success, error_message)
+    """
+    try:
+        resp = requests.post(
+            f"https://graph.microsoft.com/v1.0/users/{user_id}"
+            "/reprocessLicenseAssignment",
+            headers=_graph_headers(), timeout=20,
+        )
+    except requests.RequestException as e:
+        return False, str(e)
+    if resp.status_code in (200, 202, 204):
+        logger.info("Triggered reprocessLicenseAssignment for user %s", user_id)
+        return True, ""
+    try:
+        err = resp.json().get("error", {}).get("message", resp.text[:300])
+    except Exception:
+        err = resp.text[:300]
+    return False, f"HTTP {resp.status_code}: {err}"
 
 
 def assign_license(user_id: str, sku_id: str, disabled_plans: list = None) -> tuple:
@@ -964,11 +1711,15 @@ def get_cloud_groups() -> list:
         if g.get("onPremisesSyncEnabled") is True:
             continue
 
-        # Determine group type for display
         group_types = g.get("groupTypes", [])
+        is_dynamic = "DynamicMembership" in group_types
+        mail_enabled = bool(g.get("mailEnabled"))
+        security_enabled = bool(g.get("securityEnabled"))
+
+        # Determine group type for display
         if "Unified" in group_types:
             gtype = "M365"
-        elif g.get("securityEnabled"):
+        elif security_enabled:
             gtype = "Security"
         else:
             gtype = "Distribution"
@@ -978,6 +1729,9 @@ def get_cloud_groups() -> list:
             "display_name": g.get("displayName", ""),
             "description": g.get("description", "") or "",
             "group_type": gtype,
+            "is_dynamic": is_dynamic,
+            "mail_enabled": mail_enabled,
+            "security_enabled": security_enabled,
         })
 
     groups.sort(key=lambda x: x["display_name"].lower())
@@ -1013,38 +1767,204 @@ def get_user_cloud_groups(user_upn: str) -> list:
     return group_ids
 
 
-def add_user_to_cloud_groups(user_id: str, group_ids: list) -> list:
+def add_user_to_cloud_groups(user_id: str, group_entries: list) -> list:
     """
-    Add a user to cloud-only Entra ID groups.
+    Add a user to cloud-only Entra ID groups via Microsoft Graph.
 
-    Returns list of (group_name, success, error) tuples.
+    Args:
+        user_id: Entra user object ID
+        group_entries: list of tuples (group_id, group_name, mail_enabled).
+            Mail-enabled groups are silently skipped — they cannot be managed
+            via Graph and must be routed through
+            add_user_to_mail_enabled_groups_exo instead.
+
+    Returns:
+        List of (group_name, success, error) tuples (only for groups Graph
+        actually attempted — mail-enabled ones are excluded).
     """
     results = []
     headers = _graph_headers()
 
-    for group_id, group_name in group_ids:
+    for entry in group_entries:
+        # Tolerate 2-tuple (legacy), 3-tuple, and 4-tuple (new) shapes
+        group_id = entry[0]
+        group_name = entry[1]
+        mail_enabled = entry[2] if len(entry) > 2 else False
+        is_unified = entry[3] if len(entry) > 3 else False
+        # Skip non-Unified mail-enabled groups — those go through EXO. Unified
+        # (M365) groups must use Graph even though they're mail-enabled.
+        if mail_enabled and not is_unified:
+            continue
         body = {
             "@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
         }
-        try:
-            resp = requests.post(
-                f"https://graph.microsoft.com/v1.0/groups/{group_id}/members/$ref",
-                headers=headers,
-                json=body,
-                timeout=15,
-            )
+
+        # Retry on the replication race where the user appears via UPN lookup
+        # but the directoryObjects/{id} reference hasn't propagated yet
+        # ("Resource '<user_id>' does not exist..."). Backoff: 0, 5s, 10s.
+        last_error = ""
+        ok = False
+        for attempt, delay in enumerate((0, 5, 10)):
+            if delay:
+                time.sleep(delay)
+            try:
+                resp = requests.post(
+                    f"https://graph.microsoft.com/v1.0/groups/{group_id}/members/$ref",
+                    headers=headers,
+                    json=body,
+                    timeout=15,
+                )
+            except requests.RequestException as e:
+                last_error = str(e)
+                continue
             if resp.status_code in (200, 204):
-                logger.info("Added to cloud group: %s", group_name)
-                results.append((group_name, True, ""))
-            else:
-                error = resp.json().get("error", {}).get("message", resp.text[:200])
-                logger.error("Failed to add to cloud group %s: %s", group_name, error)
-                results.append((group_name, False, error))
-        except requests.RequestException as e:
-            logger.error("Cloud group request failed for %s: %s", group_name, e)
-            results.append((group_name, False, str(e)))
+                logger.info("Added to cloud group: %s%s",
+                             group_name,
+                             f" (attempt {attempt + 1})" if attempt else "")
+                ok = True
+                break
+            try:
+                last_error = resp.json().get("error", {}).get("message",
+                                                                resp.text[:200])
+            except Exception:
+                last_error = resp.text[:200]
+            # Only retry on the replication-race signature; everything else
+            # is a real failure (permissions, group type, etc.) — fail fast.
+            if "does not exist" not in last_error.lower():
+                break
+        if ok:
+            results.append((group_name, True, ""))
+        else:
+            logger.error("Failed to add to cloud group %s: %s",
+                         group_name, last_error)
+            results.append((group_name, False, last_error))
 
     return results
+
+
+def add_user_to_mail_enabled_groups_exo(user_upn: str, groups: list) -> list:
+    """
+    Add a user to mail-enabled distribution lists / mail-enabled security
+    groups via Exchange Online PowerShell. These groups CANNOT be managed via
+    Microsoft Graph (the /groups endpoint returns "Cannot Update a
+    mail-enabled security groups or distribution list").
+
+    Uses app-only cert auth against EXO with the same cert/clientId/tenant
+    that the rest of the tool uses. Auto-installs the EXO module in
+    CurrentUser scope if missing.
+
+    Prerequisites (set up once per customer):
+      - Office 365 Exchange Online > Exchange.ManageAsApp (Application)
+        permission on the app registration, with admin consent granted
+      - Service principal assigned an Exchange-management directory role
+        (Exchange Administrator, or higher)
+
+    Args:
+        user_upn: Target user's UPN (e.g. jane@contoso.com)
+        groups: list of (group_id, group_name, mail_enabled) — mail_enabled
+                element is ignored here; caller is expected to filter
+
+    Returns:
+        List of (group_name, success, error) tuples
+    """
+    if not groups:
+        return []
+
+    tenant_id = cfg["graph_tenant_id"]
+    client_id = cfg["graph_client_id"]
+    thumbprint = cfg["graph_cert_thumbprint"]
+
+    # Connect-ExchangeOnline -Organization expects a verified domain, NOT a
+    # tenant ID GUID. The user's UPN domain is always a verified domain in
+    # the tenant, so use that. Fall back to Graph lookup if we can't extract.
+    if "@" in user_upn:
+        org_domain = user_upn.split("@", 1)[1]
+    else:
+        org_domain = get_primary_verified_domain() or tenant_id
+
+    safe_user = sanitize_for_powershell(user_upn)
+    safe_org = sanitize_for_powershell(org_domain)
+
+    # Build a single PowerShell script that connects once and loops through
+    # all groups — much faster than reconnecting per group.
+    group_entries_ps = []
+    for entry in groups:
+        gid = sanitize_for_powershell(entry[0])
+        gname = sanitize_for_powershell(entry[1])
+        group_entries_ps.append(f"@{{Id='{gid}'; Name='{gname}'}}")
+    groups_array = ", ".join(group_entries_ps)
+
+    script = f"""
+    $ErrorActionPreference = 'Continue'
+
+    if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {{
+        try {{
+            Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser `
+                -Force -AllowClobber -ErrorAction Stop
+        }} catch {{
+            Write-Output "FATAL_INSTALL: $($_.Exception.Message)"
+            exit 1
+        }}
+    }}
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop | Out-Null
+
+    try {{
+        Connect-ExchangeOnline `
+            -AppId '{client_id}' `
+            -Organization '{safe_org}' `
+            -CertificateThumbprint '{thumbprint}' `
+            -ShowBanner:$false -ErrorAction Stop | Out-Null
+    }} catch {{
+        Write-Output "FATAL_CONNECT: $($_.Exception.Message)"
+        exit 1
+    }}
+
+    $groups = @({groups_array})
+    $results = @()
+    foreach ($g in $groups) {{
+        try {{
+            Add-DistributionGroupMember -Identity $g.Id -Member '{safe_user}' `
+                -BypassSecurityGroupManagerCheck -ErrorAction Stop
+            $results += @{{ name = $g.Name; success = $true; error = '' }}
+        }} catch {{
+            $results += @{{ name = $g.Name; success = $false; error = $_.Exception.Message }}
+        }}
+    }}
+
+    try {{ Disconnect-ExchangeOnline -Confirm:$false | Out-Null }} catch {{ }}
+
+    $results | ConvertTo-Json -Compress -Depth 3
+    """
+
+    success, stdout, stderr = run_powershell(script, timeout=300)
+
+    if "FATAL_INSTALL" in stdout:
+        msg = stdout.replace("FATAL_INSTALL:", "EXO module install failed:").strip()
+        logger.error(msg)
+        return [(entry[1], False, msg) for entry in groups]
+
+    if "FATAL_CONNECT" in stdout:
+        msg = stdout.replace("FATAL_CONNECT:",
+                              "Connect-ExchangeOnline failed (check Exchange.ManageAsApp permission "
+                              "+ Exchange Administrator role on the service principal):").strip()
+        logger.error(msg)
+        return [(entry[1], False, msg) for entry in groups]
+
+    if not success:
+        logger.error("EXO group adds failed: %s", stderr[:300])
+        return [(entry[1], False, stderr[:300] or "Unknown EXO error") for entry in groups]
+
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Could not parse EXO output: %s", stdout[:300])
+        return [(entry[1], False, "Could not parse EXO output") for entry in groups]
+
+    # Single result becomes dict instead of list — normalize
+    if isinstance(data, dict):
+        data = [data]
+    return [(r.get("name", "?"), bool(r.get("success")), r.get("error") or "")
+            for r in data]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1355,6 +2275,408 @@ def generate_certificate_on_dc(cert_path: str = None) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  APP REGISTRATION BOOTSTRAP
+#  (delegated Graph via MSAL device-code flow — used by the Setup Wizard to
+#   find or create the customer's App Registration without leaving the tool)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Azure CLI's well-known public client ID. Multi-tenant, supports device-code
+# flow, and is widely pre-consented for admin operations in customer tenants —
+# which means a Global Admin can sign in here without any prior setup.
+WIZARD_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+
+# Display name used when searching for / creating the customer's app
+WIZARD_APP_DISPLAY_NAME = "User Provisioning Tool"
+
+# Microsoft Graph resource appId (constant across tenants)
+GRAPH_RESOURCE_APP_ID = "00000003-0000-0000-c000-000000000000"
+
+# Office 365 Exchange Online resource appId (constant across tenants).
+# Needed so the app can manage mail-enabled groups via EXO PowerShell —
+# Microsoft Graph cannot manage members of DLs / mail-enabled security groups.
+EXO_RESOURCE_APP_ID = "00000002-0000-0ff1-ce00-000000000000"
+
+# Built-in directory role: Exchange Administrator. Assigned to the app's
+# service principal so EXO app-only cert auth has rights to modify groups.
+EXCHANGE_ADMIN_ROLE_TEMPLATE_ID = "29232cdf-9323-42fd-ade2-1d097af3e4de"
+
+# Application-permission IDs grouped by resource (constants — same in every tenant)
+APP_REQUIRED_PERMISSIONS = {
+    GRAPH_RESOURCE_APP_ID: {
+        "User.ReadWrite.All":         "741f803b-c850-494e-b5df-cde7c675a1ca",
+        "Directory.ReadWrite.All":    "19dbc75e-c2e2-444c-a770-ec69d8559fc7",
+        "Organization.Read.All":      "498476ce-e0fe-48b0-b801-37ba7e2685c6",
+        "Group.ReadWrite.All":        "62a82d76-70ea-41e2-9197-370581804d09",
+        "GroupMember.ReadWrite.All":  "dbaae8cf-10b5-4b86-a4a1-f871c94c6695",
+    },
+    EXO_RESOURCE_APP_ID: {
+        "Exchange.ManageAsApp":       "dc50a0fb-09a3-484d-be87-e023b12c6440",
+    },
+}
+
+# Back-compat alias used internally
+GRAPH_APP_PERMISSIONS = APP_REQUIRED_PERMISSIONS[GRAPH_RESOURCE_APP_ID]
+
+
+def wizard_acquire_device_code_token(on_user_code) -> tuple:
+    """
+    Drive MSAL device-code flow to get a delegated Graph token that can manage
+    app registrations in whatever tenant the admin signs into.
+
+    Args:
+        on_user_code: callback(user_code, verification_uri, message) invoked as
+            soon as the device code is issued, so the UI can show it.
+
+    Returns:
+        (success, access_token, tenant_id, error)
+    """
+    try:
+        app = msal.PublicClientApplication(
+            WIZARD_CLIENT_ID,
+            authority="https://login.microsoftonline.com/organizations",
+        )
+        scopes = [
+            "https://graph.microsoft.com/Application.ReadWrite.All",
+            "https://graph.microsoft.com/RoleManagement.ReadWrite.Directory",
+        ]
+        flow = app.initiate_device_flow(scopes=scopes)
+        if "user_code" not in flow:
+            return False, None, None, (
+                f"Device flow init failed: "
+                f"{flow.get('error_description', flow)}"
+            )
+
+        on_user_code(
+            flow.get("user_code", ""),
+            flow.get("verification_uri", "https://microsoft.com/devicelogin"),
+            flow.get("message", ""),
+        )
+
+        # Blocks until the admin completes sign-in or the code expires
+        result = app.acquire_token_by_device_flow(flow)
+    except Exception as e:
+        return False, None, None, f"MSAL error: {e}"
+
+    if "access_token" not in result:
+        err = (result.get("error_description")
+               or result.get("error")
+               or str(result))
+        return False, None, None, err
+
+    tenant_id = (result.get("id_token_claims") or {}).get("tid")
+    if not tenant_id:
+        # Fall back to decoding the access_token JWT payload
+        try:
+            payload = result["access_token"].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            tenant_id = claims.get("tid")
+        except Exception:
+            tenant_id = None
+
+    return True, result["access_token"], tenant_id, None
+
+
+def find_app_registration(token: str, display_name: str) -> tuple:
+    """
+    Search the admin's tenant for an existing app registration with the given
+    display name. Returns the first match (or None if not found).
+
+    Returns:
+        (success, app|None, error)
+        app dict keys: id (object id), appId (client id), displayName,
+                       keyCredentials, requiredResourceAccess
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    safe_name = display_name.replace("'", "''")
+    url = (
+        "https://graph.microsoft.com/v1.0/applications"
+        f"?$filter=displayName eq '{safe_name}'"
+        "&$select=id,appId,displayName,keyCredentials,requiredResourceAccess"
+        "&$top=10"
+    )
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+    except requests.RequestException as e:
+        return False, None, f"Network error: {e}"
+    if r.status_code != 200:
+        return False, None, f"Graph error {r.status_code}: {r.text[:300]}"
+    items = (r.json() or {}).get("value", [])
+    if not items:
+        return True, None, None
+    return True, items[0], None
+
+
+def create_app_registration(token: str, display_name: str) -> tuple:
+    """
+    Create a new app registration with the required Microsoft Graph application
+    permissions baked in. Admin consent still needs to be granted separately.
+
+    Returns:
+        (success, app|None, error)
+        app dict keys: id, appId, displayName
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "displayName": display_name,
+        "signInAudience": "AzureADMyOrg",
+        "requiredResourceAccess": [
+            {
+                "resourceAppId": resource_app_id,
+                "resourceAccess": [
+                    {"id": pid, "type": "Role"}
+                    for pid in perms.values()
+                ],
+            }
+            for resource_app_id, perms in APP_REQUIRED_PERMISSIONS.items()
+        ],
+    }
+    try:
+        r = requests.post(
+            "https://graph.microsoft.com/v1.0/applications",
+            headers=headers, json=body, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, None, f"Network error: {e}"
+    if r.status_code not in (200, 201):
+        return False, None, f"Graph error {r.status_code}: {r.text[:300]}"
+    return True, r.json(), None
+
+
+def ensure_app_has_required_permissions(token: str, app_object_id: str,
+                                         existing: list) -> tuple:
+    """
+    Make sure the app's requiredResourceAccess covers every permission this
+    tool needs across both Microsoft Graph and Office 365 Exchange Online.
+    If the app was created outside the wizard with a subset, top it up.
+
+    Returns:
+        (success, added_permissions: list[str], error)
+    """
+    # Build a name lookup across all resources for nice reporting
+    id_to_name = {}
+    for perms in APP_REQUIRED_PERMISSIONS.values():
+        for name, pid in perms.items():
+            id_to_name[pid] = name
+
+    # Index existing resourceAccess by resourceAppId
+    existing_by_resource = {}
+    new_resource_access = []
+    for block in (existing or []):
+        rid = block.get("resourceAppId")
+        existing_by_resource[rid] = block
+        new_resource_access.append(dict(block))  # shallow copy
+
+    missing_ids = []
+    for resource_app_id, perms in APP_REQUIRED_PERMISSIONS.items():
+        needed_ids = set(perms.values())
+        existing_block = next(
+            (b for b in new_resource_access
+             if b.get("resourceAppId") == resource_app_id), None)
+        have_ids = set()
+        if existing_block:
+            for ra in existing_block.get("resourceAccess", []) or []:
+                if ra.get("type") == "Role":
+                    have_ids.add(ra.get("id"))
+        for pid in needed_ids - have_ids:
+            missing_ids.append(pid)
+            if existing_block is None:
+                existing_block = {
+                    "resourceAppId": resource_app_id,
+                    "resourceAccess": [],
+                }
+                new_resource_access.append(existing_block)
+            existing_block.setdefault("resourceAccess", []).append(
+                {"id": pid, "type": "Role"})
+
+    if not missing_ids:
+        return True, [], None
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {"requiredResourceAccess": new_resource_access}
+    try:
+        r = requests.patch(
+            f"https://graph.microsoft.com/v1.0/applications/{app_object_id}",
+            headers=headers, json=body, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, [], f"Network error: {e}"
+    if r.status_code not in (200, 204):
+        return False, [], f"Graph error {r.status_code}: {r.text[:300]}"
+
+    added_names = [id_to_name.get(pid, pid) for pid in missing_ids]
+    return True, added_names, None
+
+
+def ensure_exchange_admin_role(token: str, sp_object_id: str) -> tuple:
+    """
+    Assign the Exchange Administrator built-in directory role to the app's
+    service principal. Without this role, Connect-ExchangeOnline using the
+    app's cert succeeds but management cmdlets (Add-DistributionGroupMember,
+    etc.) fail with permission errors.
+
+    Idempotent — checks for an existing assignment first.
+
+    Returns:
+        (success, was_added: bool, error)
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # First check if the role assignment already exists
+    try:
+        r = requests.get(
+            "https://graph.microsoft.com/v1.0/roleManagement/directory/"
+            f"roleAssignments?$filter=principalId eq '{sp_object_id}'",
+            headers=headers, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, False, f"Network error: {e}"
+    if r.status_code == 200:
+        for ra in (r.json() or {}).get("value", []):
+            # roleDefinitionId here is the role-definition ID (which equals
+            # the role template ID for built-in roles).
+            if ra.get("roleDefinitionId") == EXCHANGE_ADMIN_ROLE_TEMPLATE_ID:
+                return True, False, None
+
+    # Create the assignment
+    body = {
+        "principalId": sp_object_id,
+        "roleDefinitionId": EXCHANGE_ADMIN_ROLE_TEMPLATE_ID,
+        "directoryScopeId": "/",
+    }
+    headers["Content-Type"] = "application/json"
+    try:
+        r = requests.post(
+            "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments",
+            headers=headers, json=body, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, False, f"Network error: {e}"
+    if r.status_code in (200, 201):
+        return True, True, None
+    return False, False, f"Graph error {r.status_code}: {r.text[:300]}"
+
+
+def ensure_service_principal(token: str, app_id: str) -> tuple:
+    """
+    Make sure a service principal exists for the app in the admin's tenant —
+    required before admin consent can be granted.
+
+    Returns:
+        (success, sp|None, error)
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    url = (
+        "https://graph.microsoft.com/v1.0/servicePrincipals"
+        f"?$filter=appId eq '{app_id}'&$top=1"
+    )
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+    except requests.RequestException as e:
+        return False, None, f"Network error: {e}"
+    if r.status_code == 200:
+        items = (r.json() or {}).get("value", [])
+        if items:
+            return True, items[0], None
+    try:
+        r = requests.post(
+            "https://graph.microsoft.com/v1.0/servicePrincipals",
+            headers=headers, json={"appId": app_id}, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, None, f"Network error: {e}"
+    if r.status_code not in (200, 201):
+        return False, None, f"Graph error {r.status_code}: {r.text[:300]}"
+    return True, r.json(), None
+
+
+def upload_app_cert(token: str, app_object_id: str, cer_path: str,
+                     display_name: str = "UserProvisioningTool (auto)") -> tuple:
+    """
+    Upload a .cer public key to the app registration's keyCredentials so the
+    admin doesn't have to do it manually. Reads the current keyCredentials and
+    appends, so existing certificates are preserved.
+
+    Returns:
+        (success, error)
+    """
+    try:
+        with open(cer_path, "rb") as f:
+            cer_bytes = f.read()
+    except OSError as e:
+        return False, f"Could not read .cer file: {e}"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    # Fetch existing keyCredentials so we can append rather than replace
+    try:
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/applications/{app_object_id}"
+            "?$select=keyCredentials",
+            headers=headers, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, f"Network error reading existing keys: {e}"
+    if r.status_code != 200:
+        return False, f"Graph error {r.status_code} reading existing keys: {r.text[:300]}"
+    existing_keys = (r.json() or {}).get("keyCredentials", []) or []
+
+    # Strip the 'key' field from existing entries — Graph rejects round-tripped
+    # keys that aren't base64 in the expected shape; metadata is enough to keep
+    # them visible in the portal.
+    sanitized_existing = []
+    for k in existing_keys:
+        sanitized_existing.append({
+            "keyId": k.get("keyId"),
+            "type": k.get("type"),
+            "usage": k.get("usage"),
+            "displayName": k.get("displayName"),
+            "startDateTime": k.get("startDateTime"),
+            "endDateTime": k.get("endDateTime"),
+            "customKeyIdentifier": k.get("customKeyIdentifier"),
+        })
+
+    new_key = {
+        "type": "AsymmetricX509Cert",
+        "usage": "Verify",
+        "key": base64.b64encode(cer_bytes).decode("ascii"),
+        "displayName": display_name,
+    }
+
+    body = {"keyCredentials": sanitized_existing + [new_key]}
+    try:
+        r = requests.patch(
+            f"https://graph.microsoft.com/v1.0/applications/{app_object_id}",
+            headers=headers, json=body, timeout=30,
+        )
+    except requests.RequestException as e:
+        return False, f"Network error: {e}"
+    if r.status_code not in (200, 204):
+        return False, f"Graph error {r.status_code}: {r.text[:300]}"
+    return True, None
+
+
+def admin_consent_url(tenant_id: str, client_id: str) -> str:
+    """Build the URL an admin visits to grant tenant-wide consent."""
+    return (
+        f"https://login.microsoftonline.com/{tenant_id}/adminconsent"
+        f"?client_id={client_id}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SETUP WIZARD
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1380,10 +2702,21 @@ class SetupWizard(tk.Toplevel):
         self.ad_domain_var = tk.StringVar()
         self.ad_netbios_var = tk.StringVar()
         self.email_domains_var = tk.StringVar()
+        self.default_ou_var = tk.StringVar()
+        self._wizard_ou_map = {}  # canonical -> DN
         self.tenant_id_var = tk.StringVar()
         self.client_id_var = tk.StringVar()
         self.cert_thumbprint_var = tk.StringVar()
         self.cert_path_var = tk.StringVar(value=r"C:\Certs\graph_app.pem.protected")
+
+        # State carried across pages once the admin signs into Entra ID via the
+        # 'Find or Create App Registration' button:
+        #   _wizard_token       — delegated Graph token (for cert upload, etc.)
+        #   _app_object_id      — the app registration's directory object id
+        #   _app_was_created    — True if the wizard created it (vs reused)
+        self._wizard_token = None
+        self._app_object_id = None
+        self._app_was_created = False
 
         self._pages = []
         self._build_ui()
@@ -1454,61 +2787,326 @@ class SetupWizard(tk.Toplevel):
             row=7, column=0, sticky="w", pady=(0, 8))
         ttk.Label(page, text="e.g. contoso.com, fabrikam.com",
                   foreground="gray", font=("Segoe UI", 8)).grid(
-            row=8, column=0, sticky="w")
+            row=8, column=0, sticky="w", pady=(0, 12))
+
+        ttk.Label(page, text="Default OU for new users",
+                  font=("Segoe UI", 10)).grid(
+            row=9, column=0, sticky="w", pady=(0, 2))
+        self._wizard_ou_combo = ttk.Combobox(
+            page, textvariable=self.default_ou_var, width=60, state="readonly")
+        self._wizard_ou_combo.grid(row=10, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(page, text=(
+            "Auto-loaded once the domain is detected. The form will pre-select "
+            "this OU on every run (still overridable per user)."),
+                  foreground="gray", font=("Segoe UI", 8), wraplength=600,
+                  justify="left").grid(row=11, column=0, sticky="w",
+                                        pady=(0, 12))
 
         self._domain_detect_label = ttk.Label(page, text="", foreground="gray")
-        self._domain_detect_label.grid(row=9, column=0, sticky="w", pady=(15, 0))
+        self._domain_detect_label.grid(row=12, column=0, sticky="w", pady=(8, 0))
 
     def _build_page_m365(self):
         """Page 2: Microsoft 365 / Entra ID settings."""
         page = ttk.Frame(self._page_frame)
         self._pages.append(("Microsoft 365 / Entra ID", "Step 2 of 4", page))
 
+        ttk.Label(page, text=(
+            "Sign in as a Global Admin to find or create the customer's "
+            "App Registration automatically.\n"
+            "The wizard checks for an existing app named "
+            f"'{WIZARD_APP_DISPLAY_NAME}' first."),
+            font=("Segoe UI", 9), foreground="gray", wraplength=620,
+            justify="left").grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+
+        btn_row = ttk.Frame(page)
+        btn_row.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self._find_app_btn = ttk.Button(
+            btn_row, text="Find or Create App Registration",
+            command=self._on_find_or_create_app)
+        self._find_app_btn.pack(side="left")
+
+        self._app_status_label = ttk.Label(
+            page, text="", foreground="gray", wraplength=620, justify="left")
+        self._app_status_label.grid(row=2, column=0, sticky="w", pady=(0, 10))
+
+        ttk.Separator(page, orient="horizontal").grid(
+            row=3, column=0, sticky="ew", pady=(0, 10))
+
         ttk.Label(page, text="Tenant ID (Directory ID) *",
                   font=("Segoe UI", 10)).grid(
-            row=0, column=0, sticky="w", pady=(0, 2))
+            row=4, column=0, sticky="w", pady=(0, 2))
         ttk.Entry(page, textvariable=self.tenant_id_var, width=45).grid(
-            row=1, column=0, sticky="w", pady=(0, 8))
+            row=5, column=0, sticky="w", pady=(0, 8))
 
         ttk.Label(page, text="Client ID (Application ID) *",
                   font=("Segoe UI", 10)).grid(
-            row=2, column=0, sticky="w", pady=(0, 2))
+            row=6, column=0, sticky="w", pady=(0, 2))
         ttk.Entry(page, textvariable=self.client_id_var, width=45).grid(
-            row=3, column=0, sticky="w", pady=(0, 12))
+            row=7, column=0, sticky="w", pady=(0, 12))
 
-        # Instructions panel
-        instructions_frame = ttk.LabelFrame(page, text=" How to get these values ",
-                                             padding=8)
-        instructions_frame.grid(row=4, column=0, sticky="ew", pady=(5, 0))
+        # Manual fallback instructions (collapsed by default)
+        instructions_frame = ttk.LabelFrame(
+            page, text=" Manual setup (only if the button above fails) ",
+            padding=8)
+        instructions_frame.grid(row=8, column=0, sticky="ew", pady=(5, 0))
 
         instructions = scrolledtext.ScrolledText(
             instructions_frame, wrap="char", font=("Consolas", 8),
-            height=12, bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="normal")
+            height=9, bg="#1e1e1e", fg="#d4d4d4", relief="flat", state="normal")
         instructions.pack(fill="both", expand=True)
 
         instructions.insert("1.0", (
-            "CREATE AN APP REGISTRATION\n"
-            "==========================\n\n"
             "1. Sign in to portal.azure.com as a Global Admin\n"
-            "2. Go to: Entra ID > App registrations > New registration\n"
-            "3. Name: 'User Provisioning Tool'\n"
-            "4. Supported account types: 'This organizational directory only'\n"
-            "5. Click Register\n\n"
-            "FROM THE OVERVIEW PAGE:\n"
-            "  - Application (client) ID  -->  Client ID above\n"
-            "  - Directory (tenant) ID    -->  Tenant ID above\n\n"
-            "GRANT API PERMISSIONS:\n"
-            "  1. API permissions > Add a permission > Microsoft Graph\n"
-            "  2. Application permissions > add:\n"
-            "     - User.ReadWrite.All\n"
-            "     - Directory.ReadWrite.All\n"
-            "     - Organization.Read.All\n"
-            "     - Group.ReadWrite.All\n"
-            "     - GroupMember.ReadWrite.All\n"
-            "  3. Click 'Grant admin consent' (requires Global Admin)\n\n"
-            "You will upload the certificate in the next step."
+            "2. Entra ID > App registrations > New registration\n"
+            f"3. Name: '{WIZARD_APP_DISPLAY_NAME}'\n"
+            "4. Account types: 'This organizational directory only'\n"
+            "5. Copy Application (client) ID and Directory (tenant) ID above\n\n"
+            "API permissions (Application, Microsoft Graph):\n"
+            "  User.ReadWrite.All, Directory.ReadWrite.All,\n"
+            "  Organization.Read.All, Group.ReadWrite.All,\n"
+            "  GroupMember.ReadWrite.All\n"
+            "Then click 'Grant admin consent'.\n"
+            "Upload the .cer file in step 3."
         ))
         instructions.configure(state="disabled")
+
+    def _on_find_or_create_app(self):
+        """Launch device-code sign-in then find or create the app reg."""
+        self._find_app_btn.configure(state="disabled",
+                                      text="Waiting for sign-in...")
+        self._app_status_label.configure(
+            text="Requesting device code...", foreground="blue")
+
+        # State shared between the worker thread and the UI thread
+        device_dialog = {"win": None}
+
+        def show_device_code(user_code, verification_uri, message):
+            def build():
+                win = tk.Toplevel(self)
+                win.title("Sign in to Entra ID")
+                win.geometry("520x300")
+                win.transient(self)
+                win.grab_set()
+                device_dialog["win"] = win
+
+                ttk.Label(win, text="Sign in as a Global Admin",
+                          font=("Segoe UI", 12, "bold")).pack(pady=(12, 4))
+
+                ttk.Label(win, text=(
+                    "1. Click 'Open sign-in page' (or visit the URL below).\n"
+                    "2. Enter the code shown below.\n"
+                    "3. Sign in as a Global Admin in the CUSTOMER'S tenant.\n"
+                    "4. Approve the consent prompt for 'Microsoft Azure CLI'."),
+                    justify="left", wraplength=480).pack(pady=(0, 10), padx=15)
+
+                code_var = tk.StringVar(value=user_code)
+                code_entry = ttk.Entry(win, textvariable=code_var,
+                                        font=("Consolas", 16, "bold"),
+                                        justify="center", width=14,
+                                        state="readonly")
+                code_entry.pack(pady=(0, 4))
+
+                url_var = tk.StringVar(value=verification_uri)
+                ttk.Entry(win, textvariable=url_var, width=48,
+                          state="readonly").pack(pady=(0, 10))
+
+                btns = ttk.Frame(win)
+                btns.pack(pady=(4, 8))
+
+                def copy_code():
+                    self.clipboard_clear()
+                    self.clipboard_append(user_code)
+
+                ttk.Button(btns, text="Copy code",
+                           command=copy_code).pack(side="left", padx=4)
+                ttk.Button(btns, text="Open sign-in page",
+                           command=lambda: webbrowser.open(
+                               verification_uri)).pack(side="left", padx=4)
+
+                ttk.Label(win, text=(
+                    "This dialog closes automatically once you finish "
+                    "signing in."),
+                    foreground="gray", wraplength=480).pack(pady=(8, 0),
+                                                              padx=15)
+
+            self.after(0, build)
+
+        def worker():
+            ok, token, tenant_id, err = wizard_acquire_device_code_token(
+                show_device_code)
+            self.after(0, lambda: on_auth_complete(ok, token, tenant_id, err))
+
+        def on_auth_complete(ok, token, tenant_id, err):
+            if device_dialog["win"] is not None:
+                try:
+                    device_dialog["win"].destroy()
+                except tk.TclError:
+                    pass
+            if not ok:
+                self._find_app_btn.configure(
+                    state="normal", text="Find or Create App Registration")
+                self._app_status_label.configure(
+                    text=f"Sign-in failed: {err}", foreground="red")
+                return
+
+            self._wizard_token = token
+            self._app_status_label.configure(
+                text=f"Signed in. Searching for existing app in tenant "
+                     f"{tenant_id}...",
+                foreground="blue")
+            if tenant_id and not self.tenant_id_var.get():
+                self.tenant_id_var.set(tenant_id)
+
+            threading.Thread(
+                target=lambda: self._find_or_create_app_worker(
+                    token, tenant_id),
+                daemon=True).start()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _find_or_create_app_worker(self, token, tenant_id):
+        """Background worker: search Graph for an existing app, create if needed."""
+        # 1. Search for existing app by display name
+        ok, app, err = find_app_registration(token, WIZARD_APP_DISPLAY_NAME)
+        if not ok:
+            self.after(0, lambda: self._on_app_lookup_failed(err))
+            return
+
+        if app is not None:
+            # Found one — confirm reuse on the UI thread
+            self.after(0, lambda: self._confirm_reuse_existing_app(
+                token, tenant_id, app))
+            return
+
+        # None found — create one
+        self.after(0, lambda: self._app_status_label.configure(
+            text="No existing app found. Creating a new one...",
+            foreground="blue"))
+        ok, new_app, err = create_app_registration(
+            token, WIZARD_APP_DISPLAY_NAME)
+        if not ok:
+            self.after(0, lambda: self._on_app_lookup_failed(
+                f"Create failed: {err}"))
+            return
+        self._app_was_created = True
+        self._finalize_app(token, tenant_id, new_app, added_perms=[])
+
+    def _confirm_reuse_existing_app(self, token, tenant_id, app):
+        """UI thread: prompt the admin to reuse the existing app or create new."""
+        client_id = app.get("appId", "")
+        reuse = messagebox.askyesno(
+            "Existing App Registration Found",
+            f"An app registration named '{WIZARD_APP_DISPLAY_NAME}' already "
+            f"exists in this tenant.\n\n"
+            f"  Client ID: {client_id}\n\n"
+            f"Reuse it? (Click No to create a new one with a suffixed name.)",
+            parent=self,
+        )
+
+        if reuse:
+            self._app_status_label.configure(
+                text=f"Reusing existing app. Checking permissions...",
+                foreground="blue")
+
+            def topup_worker():
+                # Make sure all required Graph permissions are present
+                ok, added, err = ensure_app_has_required_permissions(
+                    token, app["id"], app.get("requiredResourceAccess", []))
+                if not ok:
+                    self.after(0, lambda: self._on_app_lookup_failed(
+                        f"Permission top-up failed: {err}"))
+                    return
+                self._finalize_app(token, tenant_id, app, added_perms=added)
+
+            threading.Thread(target=topup_worker, daemon=True).start()
+            return
+
+        # User said "No" → create a new app with a timestamp suffix
+        new_name = (f"{WIZARD_APP_DISPLAY_NAME} "
+                     f"({datetime.now().strftime('%Y-%m-%d %H:%M')})")
+        self._app_status_label.configure(
+            text=f"Creating new app: {new_name}...", foreground="blue")
+
+        def create_worker():
+            ok, new_app, err = create_app_registration(token, new_name)
+            if not ok:
+                self.after(0, lambda: self._on_app_lookup_failed(
+                    f"Create failed: {err}"))
+                return
+            self._app_was_created = True
+            self._finalize_app(token, tenant_id, new_app, added_perms=[])
+
+        threading.Thread(target=create_worker, daemon=True).start()
+
+    def _finalize_app(self, token, tenant_id, app, added_perms):
+        """Make sure SP exists, populate UI fields, store state for later steps."""
+        ok, sp, err = ensure_service_principal(token, app["appId"])
+        if not ok:
+            self.after(0, lambda: self._on_app_lookup_failed(
+                f"Service principal step failed: {err}"))
+            return
+
+        # Assign Exchange Administrator role so EXO PowerShell (used for
+        # mail-enabled groups) has permission to manage memberships.
+        # Best-effort — surface a warning if it fails rather than blocking.
+        ea_added = False
+        ea_warning = None
+        if sp and sp.get("id"):
+            ea_ok, ea_added, ea_err = ensure_exchange_admin_role(token, sp["id"])
+            if not ea_ok:
+                ea_warning = (
+                    f"Could not assign Exchange Administrator role: {ea_err}. "
+                    f"Mail-enabled group adds via EXO will fail until this is "
+                    f"granted manually in the Azure portal "
+                    f"(Roles and administrators).")
+
+        def done():
+            self._app_object_id = app["id"]
+            self.tenant_id_var.set(tenant_id or self.tenant_id_var.get())
+            self.client_id_var.set(app["appId"])
+            self._find_app_btn.configure(
+                state="normal",
+                text=("App Registration ready  (re-run to switch)"
+                      if not self._app_was_created
+                      else "App Registration ready  (created)"))
+
+            status_lines = []
+            if self._app_was_created:
+                status_lines.append(
+                    f"Created app '{app.get('displayName', '')}'.")
+            else:
+                status_lines.append(
+                    f"Reusing existing app '{app.get('displayName', '')}'.")
+            status_lines.append(f"Client ID: {app['appId']}")
+            if added_perms:
+                status_lines.append(
+                    f"Added missing permissions: {', '.join(added_perms)}")
+            if ea_added:
+                status_lines.append(
+                    "Assigned 'Exchange Administrator' role (for EXO).")
+            status_lines.append(
+                "Next step (Certificate) will upload the .cer automatically.")
+            status_lines.append(
+                "Admin consent is granted on the final page.")
+            if ea_warning:
+                self._app_status_label.configure(
+                    text="\n".join(status_lines) + "\n" + ea_warning,
+                    foreground="orange")
+            else:
+                self._app_status_label.configure(
+                    text="\n".join(status_lines), foreground="green")
+
+        self.after(0, done)
+
+    def _on_app_lookup_failed(self, err):
+        self._find_app_btn.configure(
+            state="normal", text="Find or Create App Registration")
+        self._app_status_label.configure(
+            text=f"Failed: {err}\n"
+                 f"You can still enter Tenant ID and Client ID manually below.",
+            foreground="red")
 
     def _build_page_certificate(self):
         """Page 3: Certificate generation and configuration."""
@@ -1573,12 +3171,44 @@ class SetupWizard(tk.Toplevel):
         page.rowconfigure(1, weight=1)
         page.columnconfigure(0, weight=1)
 
-        self._save_btn = ttk.Button(page, text="Save Configuration",
+        btn_row = ttk.Frame(page)
+        btn_row.grid(row=2, column=0, sticky="w", pady=(0, 5))
+
+        self._save_btn = ttk.Button(btn_row, text="Save Configuration",
                                      command=self._on_save)
-        self._save_btn.grid(row=2, column=0, sticky="w", pady=(0, 5))
+        self._save_btn.pack(side="left")
+
+        self._consent_btn = ttk.Button(
+            btn_row, text="Grant Admin Consent (browser)",
+            command=self._on_grant_admin_consent)
+        self._consent_btn.pack(side="left", padx=(8, 0))
 
         self._save_status_label = ttk.Label(page, text="", foreground="gray")
         self._save_status_label.grid(row=3, column=0, sticky="w")
+
+    def _on_grant_admin_consent(self):
+        """Open the admin consent URL in the default browser."""
+        tenant_id = self.tenant_id_var.get().strip()
+        client_id = self.client_id_var.get().strip()
+        if not tenant_id or not client_id:
+            messagebox.showerror(
+                "Cannot Grant Consent",
+                "Tenant ID and Client ID must be set first.",
+                parent=self)
+            return
+        url = admin_consent_url(tenant_id, client_id)
+        try:
+            webbrowser.open(url)
+            self._save_status_label.configure(
+                text=("Opened admin-consent URL in your browser. "
+                      "Sign in as Global Admin and approve."),
+                foreground="green")
+        except Exception as e:
+            messagebox.showerror(
+                "Browser Launch Failed",
+                f"Could not open browser:\n{e}\n\n"
+                f"Open this URL manually:\n{url}",
+                parent=self)
 
     def _show_page(self, index: int):
         """Display the specified wizard page."""
@@ -1644,14 +3274,52 @@ class SetupWizard(tk.Toplevel):
                     if fqdn and not self.email_domains_var.get():
                         self.email_domains_var.set(fqdn)
                     self._domain_detect_label.configure(
-                        text=f"Auto-detected: {fqdn} ({netbios})",
+                        text=f"Auto-detected: {fqdn} ({netbios}) — loading OUs...",
                         foreground="green")
+                    # Now load the OU list so the admin can choose a default
+                    threading.Thread(target=self._load_wizard_ous,
+                                      daemon=True).start()
                     return
                 except json.JSONDecodeError:
                     pass
             self._domain_detect_label.configure(
                 text="Could not auto-detect domain. Enter values manually.",
                 foreground="orange")
+
+    def _load_wizard_ous(self):
+        """Load AD OUs into the wizard's default-OU combobox."""
+        try:
+            ous = get_ad_ous()
+        except Exception as e:
+            self.after(0, lambda: self._domain_detect_label.configure(
+                text=f"OU load failed: {e}", foreground="orange"))
+            return
+
+        def populate():
+            self._wizard_ou_map = {}
+            display_values = []
+            for ou in ous:
+                canonical = ou.get("canonical", ou.get("dn", ""))
+                self._wizard_ou_map[canonical] = ou.get("dn", "")
+                display_values.append(canonical)
+            self._wizard_ou_combo["values"] = display_values
+            if display_values:
+                # Default to shortest canonical (domain root) for now
+                default_idx = 0
+                shortest = len(display_values[0])
+                for i, v in enumerate(display_values):
+                    if len(v) < shortest:
+                        shortest = len(v)
+                        default_idx = i
+                self._wizard_ou_combo.current(default_idx)
+            fqdn = self.ad_domain_var.get()
+            netbios = self.ad_netbios_var.get()
+            self._domain_detect_label.configure(
+                text=(f"Auto-detected: {fqdn} ({netbios}) — "
+                      f"{len(display_values)} OUs loaded"),
+                foreground="green")
+
+        self.after(0, populate)
 
         def wrapper():
             try:
@@ -1676,6 +3344,11 @@ class SetupWizard(tk.Toplevel):
             cert_path = r"C:\Certs\graph_app.pem.protected"
             self.cert_path_var.set(cert_path)
 
+        # Compute the .cer path the generator will emit alongside the PEM
+        pem_path = (cert_path[:-len(".protected")]
+                    if cert_path.endswith(".protected") else cert_path)
+        cer_path = pem_path.replace(".pem", ".cer")
+
         def do_gen():
             return generate_certificate_on_dc(cert_path)
 
@@ -1683,14 +3356,31 @@ class SetupWizard(tk.Toplevel):
             success, thumbprint, message = result
             self._gen_cert_wizard_btn.configure(
                 state="normal", text="Generate Certificate")
-            if success:
-                self.cert_thumbprint_var.set(thumbprint)
-                self._cert_status_label.configure(
-                    text=f"Certificate generated. Thumbprint: {thumbprint}",
-                    foreground="green")
-            else:
+            if not success:
                 self._cert_status_label.configure(
                     text=f"Failed: {message[:200]}", foreground="red")
+                return
+
+            self.cert_thumbprint_var.set(thumbprint)
+
+            # If we have an active wizard token + app object id, push the .cer
+            # to the app registration automatically so the admin doesn't have
+            # to do it manually in the portal.
+            if self._wizard_token and self._app_object_id:
+                self._cert_status_label.configure(
+                    text=(f"Certificate generated. Thumbprint: {thumbprint}\n"
+                          f"Uploading public key to App Registration..."),
+                    foreground="blue")
+                threading.Thread(
+                    target=lambda: self._upload_cert_worker(
+                        cer_path, thumbprint),
+                    daemon=True).start()
+            else:
+                self._cert_status_label.configure(
+                    text=(f"Certificate generated. Thumbprint: {thumbprint}\n"
+                          f"No app registration linked in step 2 — upload "
+                          f"{cer_path} to your App Registration manually."),
+                    foreground="green")
 
         def wrapper():
             try:
@@ -1704,10 +3394,38 @@ class SetupWizard(tk.Toplevel):
 
         threading.Thread(target=wrapper, daemon=True).start()
 
+    def _upload_cert_worker(self, cer_path, thumbprint):
+        """Background: upload .cer to the linked app registration."""
+        ok, err = upload_app_cert(
+            self._wizard_token, self._app_object_id, cer_path)
+
+        def update_ui():
+            if ok:
+                self._cert_status_label.configure(
+                    text=(f"Certificate generated and uploaded.\n"
+                          f"Thumbprint: {thumbprint}"),
+                    foreground="green")
+            else:
+                self._cert_status_label.configure(
+                    text=(f"Certificate generated (thumbprint: "
+                          f"{thumbprint}) but auto-upload failed:\n"
+                          f"{err}\n"
+                          f"Upload {cer_path} manually in the Azure portal."),
+                    foreground="orange")
+
+        self.after(0, update_ui)
+
     def _populate_review(self):
         """Fill the review page with collected values."""
         email_domains = [d.strip() for d in self.email_domains_var.get().split(",")
                          if d.strip()]
+
+        app_status = ("App Registration: wired via wizard"
+                      if self._app_object_id
+                      else "App Registration: entered manually")
+        cert_step = ("  - Cert uploaded automatically (no portal upload needed)"
+                     if self._wizard_token and self._app_object_id
+                     else "  - Upload .cer file to your App Registration manually")
 
         review = (
             f"AD Domain:        {self.ad_domain_var.get()}\n"
@@ -1718,14 +3436,15 @@ class SetupWizard(tk.Toplevel):
             f"Client ID:        {self.client_id_var.get()}\n"
             f"Cert Thumbprint:  {self.cert_thumbprint_var.get()}\n"
             f"Cert Path:        {self.cert_path_var.get()}\n"
+            f"{app_status}\n"
             f"\n"
             f"Config will be saved to:\n"
             f"  {CONFIG_PATH}\n"
             f"\n"
             f"AFTER SAVING:\n"
-            f"  1. Upload the .cer file to your App Registration in Azure\n"
-            f"  2. Grant admin consent on the API permissions\n"
-            f"  3. Re-run the preflight checks"
+            f"{cert_step}\n"
+            f"  - Click 'Grant Admin Consent' below (requires Global Admin)\n"
+            f"  - Re-run the preflight checks"
         )
 
         self._review_text.configure(state="normal")
@@ -1758,10 +3477,15 @@ class SetupWizard(tk.Toplevel):
         email_domains = [d.strip() for d in self.email_domains_var.get().split(",")
                          if d.strip()]
 
+        default_ou_canonical = self.default_ou_var.get().strip()
+        default_ou_dn = self._wizard_ou_map.get(default_ou_canonical, "")
+
         config_data = {
             "ad_domain": self.ad_domain_var.get().strip(),
             "ad_netbios": self.ad_netbios_var.get().strip(),
             "email_domains": email_domains,
+            "default_ou_canonical": default_ou_canonical,
+            "default_ou_dn": default_ou_dn,
             "adsync_server": None,
             "graph_tenant_id": self.tenant_id_var.get().strip(),
             "graph_client_id": self.client_id_var.get().strip(),
@@ -1784,6 +3508,10 @@ class SetupWizard(tk.Toplevel):
             messagebox.showerror("Save Error", f"Could not write config.json:\n{e}")
             return
 
+        # Create empty titles.txt / departments.txt next to config.json if
+        # missing — admin populates them by hand to drive the form drop-downs.
+        ensure_lookup_files()
+
         # Reload config into the global cfg dict
         global cfg
         cfg = load_config()
@@ -1792,12 +3520,22 @@ class SetupWizard(tk.Toplevel):
             text=f"Saved to {CONFIG_PATH}", foreground="green")
         self._completed = True
 
+        cert_step = (
+            "1. (Already done) Cert uploaded to App Registration automatically"
+            if self._wizard_token and self._app_object_id
+            else "1. Upload the .cer file to your App Registration in Azure"
+        )
         messagebox.showinfo(
             "Configuration Saved",
             f"config.json has been saved.\n\n"
+            f"Created (if missing):\n"
+            f"  - {TITLES_PATH}\n"
+            f"  - {DEPARTMENTS_PATH}\n"
+            f"Populate these with one value per line; they drive the\n"
+            f"Job Title and Department drop-downs in the form.\n\n"
             f"Next steps:\n"
-            f"1. Upload the .cer file to your App Registration in Azure\n"
-            f"2. Grant admin consent on the API permissions\n"
+            f"{cert_step}\n"
+            f"2. Click 'Grant Admin Consent' on this page (opens browser)\n"
             f"3. Close this wizard and click 'Retry All Checks'"
         )
         self.destroy()
@@ -1844,6 +3582,10 @@ class ProvisioningApp(tk.Tk):
         self._build_ui()
 
         # Load data from AD and Graph in background threads
+        # Advanced panels (M365 Licensing, AD Groups picker, Cloud Groups)
+        # start hidden — admin reveals them with the π button bottom-right.
+        self._apply_advanced_visibility()
+
         self.after(100, self._load_startup_data)
 
     # -- UI Construction ---------------------------------------------------
@@ -1857,8 +3599,20 @@ class ProvisioningApp(tk.Tk):
 
         self.progress_bar = ttk.Progressbar(status_frame, mode="indeterminate")
         self.progress_bar.pack(fill="x")
-        self.status_label = ttk.Label(status_frame, text="Ready", foreground="gray")
-        self.status_label.pack(fill="x", pady=(2, 0))
+
+        # Bottom row: status text on the left, π toggle button on the right.
+        # The π button reveals/hides the advanced panels (M365 Licensing,
+        # AD Groups, Cloud Groups). Default state is hidden.
+        bottom_row = ttk.Frame(status_frame)
+        bottom_row.pack(fill="x", pady=(2, 0))
+        self._show_advanced = False
+        self.advanced_toggle_btn = ttk.Button(
+            bottom_row, text="π", width=3,
+            command=self._toggle_advanced_panels)
+        self.advanced_toggle_btn.pack(side="right")
+        self.status_label = ttk.Label(bottom_row, text="Ready",
+                                       foreground="gray")
+        self.status_label.pack(side="left", fill="x", expand=True)
 
         # -- Action Buttons (bottom, above status) -------------------------
         action_frame = ttk.Frame(self, padding=(10, 5))
@@ -1901,6 +3655,18 @@ class ProvisioningApp(tk.Tk):
             value=email_domains[0] if email_domains else "")
         self.job_title_var = tk.StringVar()
         self.department_var = tk.StringVar()
+        # usage_location_var stores the FRIENDLY name (e.g. "United States");
+        # at provision time we look up the 2-letter ISO code via COUNTRY_CODES
+        # for the Graph PATCH. Config defaults to a code (US) for compat —
+        # convert it to the friendly name when seeding the form.
+        configured_code = (cfg.get("default_usage_location", "US")
+                           or "US").upper()
+        configured_name = next(
+            (name for name, code in COUNTRY_CODES.items()
+             if code == configured_code),
+            "United States")
+        self.usage_location_var = tk.StringVar(value=configured_name)
+        self.office_var = tk.StringVar()
 
         self.first_name_var.trace_add("write", self._on_name_change)
         self.last_name_var.trace_add("write", self._on_name_change)
@@ -1932,13 +3698,42 @@ class ProvisioningApp(tk.Tk):
         self.username_status_label = ttk.Label(frame_user, text="")
         self.username_status_label.grid(row=r, column=3, sticky="w", pady=(3, 0))
 
+        # Job Title, Department, Office: editable Comboboxes backed by the
+        # txt files next to config.json. Free-text values are also accepted.
+        # Files are loaded on every form open so admins can edit them without
+        # restarting the app.
+        titles_values = load_lookup_list(TITLES_PATH)
+        dept_values = load_lookup_list(DEPARTMENTS_PATH)
+        office_values = load_lookup_list(OFFICES_PATH)
+
         r += 1
         ttk.Label(frame_user, text="Job Title").grid(row=r, column=0, sticky="w", pady=(3, 0))
-        ttk.Entry(frame_user, textvariable=self.job_title_var, width=20).grid(
-            row=r, column=1, sticky="ew", pady=(3, 0), padx=(0, 8))
+        self.job_title_combo = ttk.Combobox(
+            frame_user, textvariable=self.job_title_var,
+            values=titles_values, width=18)
+        self.job_title_combo.grid(row=r, column=1, sticky="ew",
+                                   pady=(3, 0), padx=(0, 8))
         ttk.Label(frame_user, text="Department").grid(row=r, column=2, sticky="w", pady=(3, 0))
-        ttk.Entry(frame_user, textvariable=self.department_var, width=20).grid(
-            row=r, column=3, sticky="ew", pady=(3, 0))
+        self.department_combo = ttk.Combobox(
+            frame_user, textvariable=self.department_var,
+            values=dept_values, width=18)
+        self.department_combo.grid(row=r, column=3, sticky="ew", pady=(3, 0))
+
+        r += 1
+        ttk.Label(frame_user, text="Office").grid(
+            row=r, column=0, sticky="w", pady=(3, 0))
+        self.office_combo = ttk.Combobox(
+            frame_user, textvariable=self.office_var,
+            values=office_values, width=18)
+        self.office_combo.grid(row=r, column=1, sticky="ew",
+                                pady=(3, 0), padx=(0, 8))
+        ttk.Label(frame_user, text="Usage Location *").grid(
+            row=r, column=2, sticky="w", pady=(3, 0))
+        self.usage_location_combo = ttk.Combobox(
+            frame_user, textvariable=self.usage_location_var,
+            values=sorted(COUNTRY_CODES.keys()), width=18, state="readonly")
+        self.usage_location_combo.grid(row=r, column=3, sticky="ew",
+                                        pady=(3, 0))
 
         frame_user.columnconfigure(1, weight=1)
         frame_user.columnconfigure(3, weight=1)
@@ -1975,25 +3770,70 @@ class ProvisioningApp(tk.Tk):
         frame_pw.columnconfigure(1, weight=1)
 
         # -- Microsoft 365 Licensing ---------------------------------------
-        frame_lic = ttk.LabelFrame(left, text=" Microsoft 365 Licensing ", padding=8)
-        frame_lic.pack(fill="x", **p)
+        # Stored on self so the π toggle can hide/show the whole frame.
+        self.frame_lic = ttk.LabelFrame(left, text=" Microsoft 365 Licensing ", padding=8)
+        self.frame_lic.pack(fill="x", **p)
+        frame_lic = self.frame_lic
+
+        # Manual license selection is OFF by default — most tenants assign
+        # licenses dynamically via group-based licensing, so a manual pick
+        # would just duplicate seats or fight the policy. Admin opts in.
+        self.manual_license_var = tk.BooleanVar(value=False)
+        self.manual_license_chk = ttk.Checkbutton(
+            frame_lic, text="Manually select license",
+            variable=self.manual_license_var,
+            command=self._on_manual_license_toggle)
+        self.manual_license_chk.grid(row=0, column=0, columnspan=2,
+                                      sticky="w")
+
+        self.license_warning_label = ttk.Label(
+            frame_lic,
+            text=("Warning — licenses may be assigned dynamically by "
+                  "group-based licensing in this tenant. Manual assignment "
+                  "could duplicate or conflict."),
+            foreground="orange", wraplength=420, font=("Segoe UI", 8),
+            justify="left")
+        self.license_warning_label.grid(row=1, column=0, columnspan=2,
+                                         sticky="w", pady=(0, 4))
+        self.license_warning_label.grid_remove()  # hidden until toggled on
 
         self.license_var = tk.StringVar()
-        ttk.Label(frame_lic, text="License").grid(row=0, column=0, sticky="w")
+        self.license_label = ttk.Label(frame_lic, text="License")
+        self.license_label.grid(row=2, column=0, sticky="w")
         lic_row = ttk.Frame(frame_lic)
-        lic_row.grid(row=0, column=1, sticky="ew")
+        lic_row.grid(row=2, column=1, sticky="ew")
         self.license_combo = ttk.Combobox(lic_row, textvariable=self.license_var,
-                                           width=35, state="readonly")
+                                           width=35, state="disabled")
         self.license_combo.pack(side="left", fill="x", expand=True)
         self.license_combo.bind("<<ComboboxSelected>>", self._on_license_change)
-        ttk.Button(lic_row, text="Refresh", width=7,
-                    command=self._refresh_licenses).pack(side="left", padx=(3, 0))
+        self.license_refresh_btn = ttk.Button(lic_row, text="Refresh", width=7,
+                                                command=self._refresh_licenses,
+                                                state="disabled")
+        self.license_refresh_btn.pack(side="left", padx=(3, 0))
 
         self.license_seats_label = ttk.Label(frame_lic, text="", foreground="gray")
-        self.license_seats_label.grid(row=1, column=1, sticky="w")
+        self.license_seats_label.grid(row=3, column=1, sticky="w")
+
+        # Always-visible license inventory — shows all SKUs and their seat
+        # counts even when the manual-select checkbox is off, so the admin can
+        # see what's available without having to enable manual mode.
+        ttk.Label(frame_lic, text="License inventory:",
+                  font=("Segoe UI", 9, "bold")).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        inv_frame = ttk.Frame(frame_lic)
+        inv_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self.license_inventory_text = tk.Text(
+            inv_frame, height=5, wrap="none", relief="flat",
+            font=("Consolas", 8), background="#f5f5f5", state="disabled")
+        inv_scroll = ttk.Scrollbar(inv_frame, orient="vertical",
+                                    command=self.license_inventory_text.yview)
+        self.license_inventory_text.configure(yscrollcommand=inv_scroll.set)
+        self.license_inventory_text.pack(side="left", fill="both", expand=True)
+        inv_scroll.pack(side="left", fill="y")
 
         self.service_plans_frame = ttk.Frame(frame_lic)
-        self.service_plans_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.service_plans_frame.grid(row=6, column=0, columnspan=2,
+                                       sticky="w", pady=(3, 0))
         self._service_plan_vars = {}
         frame_lic.columnconfigure(1, weight=1)
 
@@ -2034,6 +3874,10 @@ class ProvisioningApp(tk.Tk):
         self.copy_user_results.pack_forget()  # hidden by default
         self.copy_user_results.bind("<<ListboxSelect>>", self._on_copy_user_select)
         self._copy_user_matches = []  # list of (display, dn, upn)
+        # The chosen copy-from source (display, sam, upn). Provisioning is
+        # blocked until this is set, so AD + 365 group memberships are
+        # always inherited from a real template user.
+        self._copy_source_user = None
 
         self.copy_status_label = ttk.Label(frame_copy, text="", foreground="gray")
         self.copy_status_label.pack(anchor="w")
@@ -2044,14 +3888,24 @@ class ProvisioningApp(tk.Tk):
 
         self.ou_var = tk.StringVar()
         ttk.Label(frame_ad, text="OU *").grid(row=0, column=0, sticky="w")
-        self.ou_combo = ttk.Combobox(frame_ad, textvariable=self.ou_var, width=45, state="readonly")
-        self.ou_combo.grid(row=0, column=1, columnspan=2, sticky="ew")
+        ou_row = ttk.Frame(frame_ad)
+        ou_row.grid(row=0, column=1, columnspan=2, sticky="ew")
+        self.ou_combo = ttk.Combobox(ou_row, textvariable=self.ou_var,
+                                      width=45, state="readonly")
+        self.ou_combo.pack(side="left", fill="x", expand=True)
+        self.save_default_ou_btn = ttk.Button(
+            ou_row, text="Save as default", width=14,
+            command=self._on_save_default_ou)
+        self.save_default_ou_btn.pack(side="left", padx=(3, 0))
         self._ou_map = {}
 
-        # AD Groups filter
-        ttk.Label(frame_ad, text="Filter:").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        # AD Groups filter — refs saved so the π toggle can hide them.
+        self.ad_filter_label = ttk.Label(frame_ad, text="Filter:")
+        self.ad_filter_label.grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.ad_group_filter_var = tk.StringVar()
-        ttk.Entry(frame_ad, textvariable=self.ad_group_filter_var, width=20).grid(
+        self.ad_filter_entry = ttk.Entry(
+            frame_ad, textvariable=self.ad_group_filter_var, width=20)
+        self.ad_filter_entry.grid(
             row=1, column=1, columnspan=2, sticky="ew", pady=(3, 0))
         self.ad_group_filter_var.trace_add("write", self._on_ad_group_filter)
 
@@ -2113,7 +3967,8 @@ class ProvisioningApp(tk.Tk):
         frame_ad.rowconfigure(2, weight=1)
 
         # -- Cloud Groups (Entra ID) --------------------------------------
-        frame_cloud = ttk.LabelFrame(right, text=" Cloud Groups (Entra ID) ", padding=8)
+        self.frame_cloud = ttk.LabelFrame(right, text=" Cloud Groups (Entra ID) ", padding=8)
+        frame_cloud = self.frame_cloud  # local alias for the rest of the build
         frame_cloud.pack(fill="both", expand=True, **p)
 
         # Cloud filter
@@ -2178,9 +4033,23 @@ class ProvisioningApp(tk.Tk):
         self._run_in_thread(self._load_ad_ous, on_complete=self._populate_ous)
         self._run_in_thread(self._load_ad_groups, on_complete=self._populate_ad_groups)
         self._run_in_thread(self._load_upn_suffixes, on_complete=self._populate_email_domains)
+        self._run_in_thread(get_primary_verified_domain,
+                            on_complete=self._apply_primary_domain)
         self._run_in_thread(self._load_cloud_groups, on_complete=self._populate_cloud_groups)
         self._run_in_thread(self._load_licenses, on_complete=self._populate_licenses)
         self._run_in_thread(self._detect_sync, on_complete=self._show_sync_status)
+
+    def _apply_primary_domain(self, primary_domain: str):
+        """Promote the tenant's primary verified domain to the default email."""
+        if not primary_domain:
+            return
+        current_values = list(self.email_combo["values"] or [])
+        # Move primary to the top if present; otherwise prepend it
+        lower = primary_domain.lower()
+        deduped = [d for d in current_values if d.lower() != lower]
+        new_values = [primary_domain] + deduped
+        self.email_combo["values"] = new_values
+        self.email_domain_var.set(primary_domain)
 
     def _load_ad_ous(self):
         return get_ad_ous()
@@ -2194,15 +4063,23 @@ class ProvisioningApp(tk.Tk):
             self._ou_map[canonical] = ou.get("dn", "")
             display_values.append(canonical)
         self.ou_combo["values"] = display_values
-        if display_values:
-            # Default to the domain root (shortest canonical path = shallowest OU)
-            default_idx = 0
+        if not display_values:
+            return
+
+        # Pre-select the OU saved by the setup wizard, if it's still valid.
+        # Falls back to the shallowest OU (shortest canonical path) so first
+        # runs and post-wizard upgrades both behave sensibly.
+        configured = cfg.get("default_ou_canonical", "")
+        default_idx = 0
+        if configured and configured in display_values:
+            default_idx = display_values.index(configured)
+        else:
             shortest_len = len(display_values[0])
             for i, val in enumerate(display_values):
                 if len(val) < shortest_len:
                     shortest_len = len(val)
                     default_idx = i
-            self.ou_combo.current(default_idx)
+        self.ou_combo.current(default_idx)
 
     def _load_upn_suffixes(self):
         return get_ad_upn_suffixes()
@@ -2267,17 +4144,27 @@ class ProvisioningApp(tk.Tk):
             return []
 
     def _populate_cloud_groups(self, groups):
-        self._cloud_groups_all = groups
-        if not groups:
+        # Filter out dynamic groups (membership is rule-based; cannot be
+        # modified manually). Surface the count in the status label so the
+        # admin knows why a group they expected isn't here.
+        dynamic_count = sum(1 for g in groups if g.get("is_dynamic"))
+        self._cloud_groups_all = [g for g in groups if not g.get("is_dynamic")]
+
+        if not self._cloud_groups_all:
             self.cloud_groups_status.configure(
-                text="No cloud-only groups found (all groups may be synced from AD)",
+                text=("No cloud-only groups found "
+                      "(all groups may be synced from AD or dynamic)"),
                 foreground="gray")
             self._render_cloud_groups()
             return
 
         self._render_cloud_groups()
-        self.cloud_groups_status.configure(
-            text=f"{len(groups)} cloud groups loaded", foreground="green")
+        status = (f"{len(self._cloud_groups_all)} cloud groups loaded")
+        if dynamic_count:
+            status += (
+                f" ({dynamic_count} dynamic group(s) hidden — "
+                f"membership is auto-managed)")
+        self.cloud_groups_status.configure(text=status, foreground="green")
 
     def _render_cloud_groups(self, filter_text=""):
         """Render cloud groups into tabbed listboxes, filtered by search text."""
@@ -2298,19 +4185,31 @@ class ProvisioningApp(tk.Tk):
             if ft and ft not in name.lower() and ft not in desc.lower():
                 continue
 
-            entry = (g["id"], name)
             gtype = g.get("group_type", "Security")
+            is_unified = (gtype == "M365")
+            mail_enabled = g.get("mail_enabled", False)
+            # EXO routing applies only to mail-enabled groups that are NOT
+            # M365/Unified — Unified groups must go through Graph instead
+            # (Add-DistributionGroupMember errors on Unified groups with
+            # "current operation is not supported on GroupMailbox").
+            needs_exo = mail_enabled and not is_unified
 
-            if gtype == "M365":
-                self.cloud_m365_listbox.insert("end", name)
+            display = f"{name}  [Mail]" if needs_exo else name
+            # Tuple shape: (id, name, mail_enabled, is_unified). Mail flag is
+            # retained for backwards compatibility with the older 3-tuple
+            # consumers; routing logic now uses is_unified too.
+            entry = (g["id"], name, mail_enabled, is_unified)
+
+            if is_unified:
+                self.cloud_m365_listbox.insert("end", display)
                 self._cloud_m365_map[m365_idx] = entry
                 m365_idx += 1
             elif gtype == "Distribution":
-                self.cloud_distribution_listbox.insert("end", name)
+                self.cloud_distribution_listbox.insert("end", display)
                 self._cloud_distribution_map[dist_idx] = entry
                 dist_idx += 1
             else:
-                self.cloud_security_listbox.insert("end", name)
+                self.cloud_security_listbox.insert("end", display)
                 self._cloud_security_map[sec_idx] = entry
                 sec_idx += 1
 
@@ -2328,6 +4227,34 @@ class ProvisioningApp(tk.Tk):
             values.append(f"{lic['friendly_name']} ({lic['available']}/{lic['total']} available)")
         self.license_combo["values"] = values
         self.license_combo.current(0)
+        self._render_license_inventory(licenses)
+
+    def _render_license_inventory(self, licenses, highlight_skus=None):
+        """
+        Render the always-visible inventory panel. If highlight_skus is given
+        (set of skuId / skuPartNumber), those rows get a marker prefix so the
+        admin can see at a glance which licenses overlap with a copy-from
+        user's existing assignments.
+        """
+        highlight = set(highlight_skus or [])
+        self.license_inventory_text.configure(state="normal")
+        self.license_inventory_text.delete("1.0", "end")
+        if not licenses:
+            self.license_inventory_text.insert("end",
+                "(no licenses returned \u2014 check Graph permissions or sign-in)")
+        else:
+            for lic in licenses:
+                marker = "*" if (
+                    lic.get("sku_id") in highlight
+                    or lic.get("sku_name") in highlight
+                ) else " "
+                available = lic.get("available", "?")
+                total = lic.get("total", "?")
+                name = lic.get("friendly_name", "?")
+                self.license_inventory_text.insert(
+                    "end",
+                    f"{marker} {available:>4} / {total:<4}  {name}\n")
+        self.license_inventory_text.configure(state="disabled")
 
     def _detect_sync(self):
         return detect_sync_server()
@@ -2344,6 +4271,82 @@ class ProvisioningApp(tk.Tk):
                 text="Not detected \u2014 enter manually or skip sync", foreground="orange")
 
     # -- Event Handlers ----------------------------------------------------
+
+    def _apply_advanced_visibility(self):
+        """
+        Show or hide the M365 Licensing, AD Groups, and Cloud Groups widgets
+        based on self._show_advanced. OU + Manager (inside the AD frame) and
+        the Copy-from User panel always remain visible.
+        """
+        show = self._show_advanced
+        # M365 Licensing — whole LabelFrame
+        if show:
+            self.frame_lic.pack(fill="x", padx=0, pady=3)
+        else:
+            self.frame_lic.pack_forget()
+        # Cloud Groups — whole LabelFrame
+        if show:
+            self.frame_cloud.pack(fill="both", expand=True, padx=0, pady=3)
+        else:
+            self.frame_cloud.pack_forget()
+        # AD Groups portion inside the AD frame (filter + notebook).
+        # OU/Manager rows stay because they're in different grid rows.
+        ad_groups_widgets = (
+            self.ad_filter_label, self.ad_filter_entry, self.ad_notebook,
+        )
+        for w in ad_groups_widgets:
+            if show:
+                w.grid()
+            else:
+                w.grid_remove()
+
+    def _toggle_advanced_panels(self):
+        """Flip the advanced-panels state and re-render."""
+        self._show_advanced = not self._show_advanced
+        self._apply_advanced_visibility()
+
+    def _on_manual_license_toggle(self):
+        """Enable / disable the License section based on the manual checkbox."""
+        manual = self.manual_license_var.get()
+        if manual:
+            self.license_combo.configure(state="readonly")
+            self.license_refresh_btn.configure(state="normal")
+            self.license_warning_label.grid()
+        else:
+            self.license_combo.configure(state="disabled")
+            self.license_refresh_btn.configure(state="disabled")
+            self.license_warning_label.grid_remove()
+            self.license_seats_label.configure(text="")
+            # Clear any picked service-plan disables
+            for widget in self.service_plans_frame.winfo_children():
+                widget.destroy()
+            self._service_plan_vars = {}
+            # Reset selection to "(None — skip licensing)"
+            if self.license_combo["values"]:
+                self.license_combo.current(0)
+
+    def _on_save_default_ou(self):
+        """Persist the currently-selected OU as the default in config.json."""
+        canonical = self.ou_var.get().strip()
+        if not canonical:
+            messagebox.showwarning("No OU Selected",
+                                    "Pick an OU before saving as default.",
+                                    parent=self)
+            return
+        dn = self._ou_map.get(canonical, "")
+        ok, err = update_config({
+            "default_ou_canonical": canonical,
+            "default_ou_dn": dn,
+        })
+        if ok:
+            self._update_status(f"Default OU saved: {canonical}")
+            messagebox.showinfo("Default OU Saved",
+                                f"config.json updated.\nDefault OU: {canonical}",
+                                parent=self)
+        else:
+            messagebox.showerror("Save Failed",
+                                  f"Could not update config.json:\n{err}",
+                                  parent=self)
 
     def _on_ad_group_filter(self, *_args):
         """Re-render AD groups filtered by search text."""
@@ -2416,6 +4419,7 @@ class ProvisioningApp(tk.Tk):
             return
 
         display, user_sam, user_upn = self._copy_user_matches[idx]
+        self._copy_source_user = (display, user_sam, user_upn)
         self.copy_user_results.pack_forget()
         self.copy_status_label.configure(text=f"Loading groups for {display}...",
                                           foreground="blue")
@@ -2423,15 +4427,62 @@ class ProvisioningApp(tk.Tk):
         def fetch_groups():
             ad_group_dns = get_user_ad_groups(user_sam) if user_sam else []
             cloud_group_ids = get_user_cloud_groups(user_upn) if user_upn else []
-            return ad_group_dns, cloud_group_ids
+            assigned_licenses = (get_user_assigned_licenses(user_upn)
+                                 if user_upn else [])
+            return ad_group_dns, cloud_group_ids, assigned_licenses
 
         def on_result(result):
-            ad_group_dns, cloud_group_ids = result
+            ad_group_dns, cloud_group_ids, assigned_licenses = result
             ad_count = self._select_ad_groups_by_dn(ad_group_dns)
             cloud_count = self._select_cloud_groups_by_id(cloud_group_ids)
-            self.copy_status_label.configure(
-                text=f"Copied {ad_count} AD + {cloud_count} cloud groups from {display}",
-                foreground="green")
+
+            # Compare the copy-from user's licenses against the tenant
+            # inventory so the admin can see which licenses overlap and how
+            # many seats are free. Highlight matched SKUs in the inventory
+            # panel with a '*' marker. Each line shows the source
+            # (User=direct, Group=group-based/dynamic) so the admin knows
+            # whether a license will be inherited automatically.
+            inventory = self._licenses or []
+            inv_by_sku_id = {l.get("sku_id"): l for l in inventory}
+
+            license_lines = []
+            highlight_ids = set()
+            for al in assigned_licenses:
+                sid = al.get("sku_id") or ""
+                sources = al.get("sources") or set()
+                # "User" = direct manual assignment; "Group" = group-based
+                # (covers both static groups and dynamic-membership groups)
+                src_labels = []
+                if "user" in sources:
+                    src_labels.append("Direct")
+                if "group" in sources:
+                    src_labels.append("Group")
+                src_str = "+".join(src_labels) if src_labels else "?"
+
+                match = inv_by_sku_id.get(sid)
+                if match:
+                    highlight_ids.add(match.get("sku_id"))
+                    avail = match.get("available", 0)
+                    total = match.get("total", 0)
+                    marker = "OK" if avail > 0 else "FULL"
+                    license_lines.append(
+                        f"  [{marker}] {match.get('friendly_name')} "
+                        f"({avail}/{total} free) via {src_str}")
+                else:
+                    license_lines.append(
+                        f"  [N/A] {sid} (not in tenant inventory) via {src_str}")
+
+            # Re-render the inventory panel with markers for the matched SKUs
+            self._render_license_inventory(inventory,
+                                            highlight_skus=highlight_ids)
+
+            status = (f"Copied {ad_count} AD + {cloud_count} cloud groups "
+                      f"from {display}")
+            if assigned_licenses:
+                status += (f"\nLicenses assigned to {display} "
+                            f"({len(assigned_licenses)}):\n"
+                            + "\n".join(license_lines))
+            self.copy_status_label.configure(text=status, foreground="green")
 
         self._run_in_thread(fetch_groups, on_complete=on_result)
 
@@ -2461,16 +4512,16 @@ class ProvisioningApp(tk.Tk):
         """Auto-select cloud groups across all tabs by ID. Returns count selected."""
         id_set = set(group_ids)
         count = 0
-        for idx, (gid, _) in self._cloud_security_map.items():
-            if gid in id_set:
+        for idx, entry in self._cloud_security_map.items():
+            if entry[0] in id_set:
                 self.cloud_security_listbox.selection_set(idx)
                 count += 1
-        for idx, (gid, _) in self._cloud_m365_map.items():
-            if gid in id_set:
+        for idx, entry in self._cloud_m365_map.items():
+            if entry[0] in id_set:
                 self.cloud_m365_listbox.selection_set(idx)
                 count += 1
-        for idx, (gid, _) in self._cloud_distribution_map.items():
-            if gid in id_set:
+        for idx, entry in self._cloud_distribution_map.items():
+            if entry[0] in id_set:
                 self.cloud_distribution_listbox.selection_set(idx)
                 count += 1
         return count
@@ -2648,6 +4699,7 @@ class ProvisioningApp(tk.Tk):
         self.cloud_group_filter_var.set("")
         self.copy_user_search_var.set("")
         self.copy_status_label.configure(text="")
+        self._copy_source_user = None
         self.license_combo.current(0)
         self.username_status_label.configure(text="")
         self.license_seats_label.configure(text="")
@@ -2721,6 +4773,19 @@ class ProvisioningApp(tk.Tk):
             messagebox.showerror("Validation Error", "\n".join(f"- {e}" for e in errors))
             return
 
+        # Require a copy-from user — without it we'd create a blank account
+        # with no AD groups, no cloud groups, and likely no license fit. Force
+        # the admin to pick a template user so permissions are inherited.
+        if not self._copy_source_user:
+            messagebox.showerror(
+                "Copy-from User Required",
+                "Pick a user to copy AD + 365 group memberships from before "
+                "provisioning.\n\n"
+                "Use the 'Copy Groups From User' box at the top-right to "
+                "search for a template user (someone with the same role/"
+                "permissions as the new hire).")
+            return
+
         # Confirm with user
         username = self.username_var.get().strip()
         if not messagebox.askyesno(
@@ -2771,6 +4836,9 @@ class ProvisioningApp(tk.Tk):
         ou_canonical = self.ou_var.get()
         ou_dn = self._ou_map.get(ou_canonical, "")
 
+        country_name = self.usage_location_var.get().strip()
+        country_code = COUNTRY_CODES.get(country_name, "")
+
         params = {
             "first_name": self.first_name_var.get().strip(),
             "last_name": self.last_name_var.get().strip(),
@@ -2779,6 +4847,9 @@ class ProvisioningApp(tk.Tk):
             "email": f"{username}@{email_domain}",
             "title": self.job_title_var.get().strip(),
             "department": self.department_var.get().strip(),
+            "office": self.office_var.get().strip(),
+            "country_code": country_code,
+            "country_name": country_name,
             "ou_dn": ou_dn,
             "password": self.password_var.get(),
             "force_change": self.force_change_var.get(),
@@ -2797,6 +4868,19 @@ class ProvisioningApp(tk.Tk):
 
         results["ad_created"] = True
         results["ad_user_dn"] = user_dn
+
+        # Sticky-OU: if the admin provisioned into an OU different from the
+        # saved default, quietly update config.json so next launch defaults
+        # to this OU. Failures are non-fatal — the user already exists.
+        if ou_canonical and ou_canonical != cfg.get("default_ou_canonical"):
+            ok, err = update_config({
+                "default_ou_canonical": ou_canonical,
+                "default_ou_dn": ou_dn,
+            })
+            if not ok:
+                logger.warning("Could not persist default OU: %s", err)
+            else:
+                logger.info("Default OU updated to: %s", ou_canonical)
 
         # -- Step 2: Set Manager -------------------------------------------
         manager_dn = self.manager_dn_var.get()
@@ -2825,7 +4909,13 @@ class ProvisioningApp(tk.Tk):
 
         # -- Step 4: License and Sync --------------------------------------
         lic_selection = self.license_var.get()
-        wants_license = lic_selection and not lic_selection.startswith("(None")
+        # Only assign a license if the admin explicitly opted in via the
+        # 'Manually select license' checkbox AND picked a real SKU. Most
+        # tenants use group-based licensing so manual assignment is the
+        # exception, not the default.
+        wants_license = (self.manual_license_var.get()
+                         and lic_selection
+                         and not lic_selection.startswith("(None"))
 
         # Gather cloud groups from all tabs
         cloud_group_selections = []
@@ -2863,8 +4953,11 @@ class ProvisioningApp(tk.Tk):
                 self._update_status_ts("Sync skipped \u2014 waiting for user to appear in Entra...")
                 results["sync_triggered"] = True  # Skipped intentionally
 
-            # Poll for user in Entra ID
-            upn = f"{username}@{ad_domain}"
+            # Poll for user in Entra ID using the cloud UPN — must match what
+            # create_ad_user wrote (email's domain, NOT the AD domain). When
+            # AD domain (contoso.local) differs from the email domain
+            # (contoso.com) the cloud UPN is the latter.
+            upn = params["email"]
             self._update_status_ts("Waiting for user to appear in Entra ID...")
             start_time = time.time()
 
@@ -2887,6 +4980,38 @@ class ProvisioningApp(tk.Tk):
                     break
 
                 time.sleep(poll_interval)
+
+            # -- Step 4b: Set usageLocation IMMEDIATELY ---------------------
+            # Run this before the licensing/group steps below so that any
+            # dynamic group-based licensing kicked off by group membership
+            # has a non-null usageLocation to work with. Without this, group
+            # license assignments race ahead and fail with "License
+            # assignment cannot be done for user with invalid usage
+            # location," leaving the user in ProcessingFailed state.
+            if results["entra_found"]:
+                usage_code = params.get("country_code", "")
+                if usage_code:
+                    self._update_status_ts(
+                        f"Setting usageLocation={usage_code}...")
+                    ul_ok, ul_err = set_usage_location(
+                        results["entra_user_id"], usage_code)
+                    if not ul_ok:
+                        results["errors"].append(
+                            f"usageLocation set: {ul_err}")
+                    else:
+                        # Nudge the License Processing Service to retry any
+                        # group-based assignments that may have already
+                        # failed because usageLocation was empty.
+                        self._update_status_ts(
+                            "Reprocessing user license assignments...")
+                        rp_ok, rp_err = reprocess_user_license_assignment(
+                            results["entra_user_id"])
+                        if not rp_ok:
+                            # Non-fatal — usageLocation is set, group
+                            # licensing will retry on its own schedule.
+                            logger.warning(
+                                "License reprocess request failed: %s",
+                                rp_err)
 
             # -- Step 5: Assign License ------------------------------------
             if results["entra_found"] and wants_license:
@@ -2914,9 +5039,36 @@ class ProvisioningApp(tk.Tk):
                     results["errors"].append("Cancelled by user")
                     return results
 
-                self._update_status_ts("Adding to cloud groups...")
-                cloud_results = add_user_to_cloud_groups(
-                    results["entra_user_id"], cloud_group_selections)
+                # Partition: Graph for plain security groups + M365/Unified
+                # groups; EXO PowerShell for non-Unified mail-enabled groups
+                # (DLs and mail-enabled security groups). Add-DistributionGroupMember
+                # fails on M365/Unified groups ("operation not supported on
+                # GroupMailbox"), so those must go through Graph even though
+                # they have mailEnabled=true.
+                def needs_exo(g):
+                    mail_enabled = len(g) > 2 and g[2]
+                    is_unified = len(g) > 3 and g[3]
+                    return mail_enabled and not is_unified
+                graph_groups = [g for g in cloud_group_selections
+                                 if not needs_exo(g)]
+                exo_groups = [g for g in cloud_group_selections
+                               if needs_exo(g)]
+
+                cloud_results = []
+
+                if graph_groups:
+                    self._update_status_ts("Adding to cloud groups (Graph)...")
+                    cloud_results.extend(add_user_to_cloud_groups(
+                        results["entra_user_id"], graph_groups))
+
+                if exo_groups:
+                    self._update_status_ts(
+                        f"Adding to {len(exo_groups)} mail-enabled "
+                        f"group(s) via Exchange Online...")
+                    user_upn = params["email"]
+                    cloud_results.extend(add_user_to_mail_enabled_groups_exo(
+                        user_upn, exo_groups))
+
                 results["cloud_groups_added"] = cloud_results
                 for gname, gsuccess, gerror in cloud_results:
                     if not gsuccess:
@@ -3257,6 +5409,33 @@ REMEDIATION = {
 }
 
 
+def _preflight_check_elevation() -> tuple:
+    """
+    Verify the process is running with administrator (elevated) privileges.
+
+    Without elevation, Windows gives the process a UAC-filtered token: even if
+    the signed-in account is a Domain Admin, admin group SIDs are flagged
+    'deny only', so WindowsPrincipal.IsInRole() reports them as absent and
+    New-ADUser fails with Access Denied.
+    """
+    if os.name != "nt":
+        return CHECK_PASS, "Non-Windows host — elevation check skipped"
+    try:
+        import ctypes
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception as e:
+        return CHECK_WARN, f"Could not determine elevation status: {e}"
+    if is_admin:
+        return CHECK_PASS, "Process is running elevated (administrator)"
+    return CHECK_FAIL, (
+        "Process is NOT running elevated. Even a Domain Admin account is "
+        "handed a UAC-filtered token without elevation, which makes "
+        "New-ADUser fail with Access Denied. Close this window, then "
+        "right-click the EXE and choose 'Run as administrator' "
+        "(or launch from an elevated PowerShell/cmd window)."
+    )
+
+
 def _preflight_check_config() -> tuple:
     """Verify config.json exists, is valid JSON, and has required keys."""
     if not os.path.isfile(CONFIG_PATH):
@@ -3302,19 +5481,82 @@ def _preflight_check_ad_module() -> tuple:
 
 
 def _preflight_check_ad_permissions() -> tuple:
-    """Verify the current user can query AD (read OUs as a basic permission test)."""
-    script = """
-    Import-Module ActiveDirectory
-    $count = (Get-ADOrganizationalUnit -Filter * | Measure-Object).Count
-    Write-Output "OUS:$count"
     """
-    success, stdout, stderr = run_powershell(script, timeout=15)
-    if success and "OUS:" in stdout:
-        count = stdout.split("OUS:")[1].strip()
-        return CHECK_PASS, f"AD read access confirmed \u2014 {count} OUs found"
-    if "access" in stderr.lower() or "denied" in stderr.lower():
-        return CHECK_FAIL, "Insufficient AD permissions"
-    return CHECK_WARN, f"Could not verify AD permissions: {stderr[:150]}"
+    Verify the current user has write access in AD (i.e. can create user objects).
+
+    Read-only tests like 'count the OUs' pass for any domain user, which gave
+    false confidence in previous versions. This check inspects the current
+    Windows security token for membership in any group that has built-in
+    user-create rights:
+
+        Domain Admins        (<domain-sid>-512)
+        Enterprise Admins    (<root-domain-sid>-519)
+        Builtin\\Administrators (S-1-5-32-544)
+        Builtin\\Account Operators (S-1-5-32-548)
+
+    Token-based membership covers nested groups automatically.
+    """
+    script = """
+    Import-Module ActiveDirectory -ErrorAction Stop
+
+    $domain = Get-ADDomain
+    $domainSid = $domain.DomainSID.Value
+    $rootSid = (Get-ADDomain -Identity (Get-ADForest).RootDomain).DomainSID.Value
+
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $wp = New-Object System.Security.Principal.WindowsPrincipal($id)
+
+    $checks = @(
+        @{Name='Domain Admins';        Sid="$domainSid-512"},
+        @{Name='Enterprise Admins';    Sid="$rootSid-519"},
+        @{Name='Administrators';       Sid='S-1-5-32-544'},
+        @{Name='Account Operators';    Sid='S-1-5-32-548'}
+    )
+
+    $memberOf = @()
+    foreach ($c in $checks) {
+        try {
+            $sid = New-Object System.Security.Principal.SecurityIdentifier($c.Sid)
+            if ($wp.IsInRole($sid)) { $memberOf += $c.Name }
+        } catch { }
+    }
+
+    $result = @{
+        user = $id.Name
+        memberOf = $memberOf
+        hasWriteRights = ($memberOf.Count -gt 0)
+        ouCount = (Get-ADOrganizationalUnit -Filter * | Measure-Object).Count
+    }
+    $result | ConvertTo-Json -Compress
+    """
+    success, stdout, stderr = run_powershell(script, timeout=20)
+    if not success:
+        if "access" in stderr.lower() or "denied" in stderr.lower():
+            return CHECK_FAIL, "Insufficient AD permissions (cannot even read AD)"
+        return CHECK_WARN, f"Could not verify AD permissions: {stderr[:150]}"
+
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return CHECK_WARN, f"Could not parse permission check output: {stdout[:150]}"
+
+    user = data.get("user", "unknown")
+    member_of = data.get("memberOf") or []
+    ou_count = data.get("ouCount", 0)
+    has_write = data.get("hasWriteRights", False)
+
+    if has_write:
+        return CHECK_PASS, (
+            f"{user} \u2014 member of: {', '.join(member_of)} "
+            f"(can create users; {ou_count} OUs visible)"
+        )
+
+    return CHECK_FAIL, (
+        f"{user} is NOT a member of Domain Admins, Enterprise Admins, "
+        f"Administrators, or Account Operators. New-ADUser will fail. "
+        f"Add the account to Domain Admins (recommended for an MSP tool) or "
+        f"delegate 'Create User Objects' rights on the target OU and re-run."
+    )
 
 
 def _preflight_check_network() -> tuple:
@@ -3441,6 +5683,7 @@ def _preflight_check_adsync() -> tuple:
 
 # Ordered list of preflight checks: (name, display_label, check_function, is_required)
 PREFLIGHT_CHECKS = [
+    ("elevation",      "Administrator Elevation",     _preflight_check_elevation,       True),
     ("config",         "Configuration",               _preflight_check_config,          True),
     ("powershell",     "PowerShell",                  _preflight_check_powershell,      True),
     ("ad_module",      "AD PowerShell Module",        _preflight_check_ad_module,       True),
@@ -3480,7 +5723,7 @@ class PreflightDialog(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Preflight Check \u2014 365 User Provisioning")
-        self.geometry("820x700")
+        self.geometry("820x780")
         self.resizable(True, True)
 
         self._checks_passed = False
@@ -3542,6 +5785,21 @@ class PreflightDialog(tk.Tk):
         self.summary_label = ttk.Label(self, text="", font=("Segoe UI", 10, "bold"))
         self.summary_label.pack(pady=(0, 5))
 
+        # -- Main buttons (packed first with side="bottom" so they're always
+        # anchored at the bottom even if the detail pane expands to fill space)
+        btn_frame = ttk.Frame(self, padding=(15, 5))
+        btn_frame.pack(side="bottom", fill="x")
+
+        self.continue_btn = ttk.Button(btn_frame, text="Continue", state="disabled",
+                                        command=self._on_continue)
+        self.continue_btn.pack(side="left", padx=5)
+
+        self.retry_btn = ttk.Button(btn_frame, text="Retry All Checks", state="disabled",
+                                     command=self._on_retry)
+        self.retry_btn.pack(side="left", padx=5)
+
+        ttk.Button(btn_frame, text="Quit", command=self._on_quit).pack(side="right", padx=5)
+
         # -- Detail pane (remediation instructions) ------------------------
         detail_frame = ttk.LabelFrame(self, text=" Setup Instructions ", padding=8)
         detail_frame.pack(fill="both", expand=True, padx=15, pady=(0, 5))
@@ -3573,20 +5831,6 @@ class PreflightDialog(tk.Tk):
             self.detail_btn_frame, text="Copy to Clipboard",
             command=self._copy_detail_to_clipboard)
         self.copy_btn.pack(side="right")
-
-        # -- Main buttons --------------------------------------------------
-        btn_frame = ttk.Frame(self, padding=(15, 5))
-        btn_frame.pack(fill="x")
-
-        self.continue_btn = ttk.Button(btn_frame, text="Continue", state="disabled",
-                                        command=self._on_continue)
-        self.continue_btn.pack(side="left", padx=5)
-
-        self.retry_btn = ttk.Button(btn_frame, text="Retry All Checks", state="disabled",
-                                     command=self._on_retry)
-        self.retry_btn.pack(side="left", padx=5)
-
-        ttk.Button(btn_frame, text="Quit", command=self._on_quit).pack(side="right", padx=5)
 
         # Show welcome message in detail pane
         self._set_detail_text(
