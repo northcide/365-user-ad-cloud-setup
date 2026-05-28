@@ -5980,8 +5980,12 @@ class PreflightDialog(tk.Tk):
             self._checks_passed = True
             self.continue_btn.configure(state="normal")
             self.summary_label.configure(
-                text="ALL CHECKS PASSED \u2014 ready to launch",
+                text="ALL CHECKS PASSED \u2014 launching...",
                 foreground="green")
+            # All required checks passed and no warnings \u2014 auto-advance to
+            # the provisioning screen. Short delay so the green status
+            # message is visible (1.2s).
+            self.after(1200, self._on_continue)
 
     def _on_generate_cert(self):
         """Generate a certificate for Graph API auth."""
